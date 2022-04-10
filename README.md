@@ -1,8 +1,8 @@
 # SmallScience
 
-![chippy](chippy.png)
-
 SmallScience (inspired by the amazing [BigScience](https://bigscience.huggingface.co/)) is my humble learning experience to train a large (but not that large) transformer model.
+
+![chippy](chippy.png)
 
 My goals are:
 
