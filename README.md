@@ -13,4 +13,4 @@ My TLDR goals:
 
 I would love this to be a joint effort with people from the community, so more than happy to collaborate with others!
 
-All my progress/mistakes/thoughts current can be found in the [discussions](https://github.com/SeanNaren/SmallScience/discussions).
+All my progress/mistakes/thoughts current can be found in the [issues](https://github.com/SeanNaren/SmallScience/issues).
