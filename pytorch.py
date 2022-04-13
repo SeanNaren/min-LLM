@@ -1,22 +1,22 @@
+import argparse
+import logging
 import math
 import os
-from typing import Any, Union
+from pprint import pprint
 
+import deepspeed
 import fire
-import pytorch_lightning as pl
 import torch
 import torch.nn as nn
+from deepspeed.ops.adam import FusedAdam
 from deepspeed.profiling.flops_profiler import FlopsProfiler
-from pytorch_lightning import Trainer, seed_everything, Callback
-from pytorch_lightning.strategies import DeepSpeedStrategy
-from pytorch_lightning.utilities import rank_zero_info
+from pytorch_lightning import seed_everything
 from torch.nn import functional as F
 from torch.utils.data import DataLoader, Dataset, RandomSampler
-
 from xformers.factory.model_factory import xFormer, xFormerConfig
 
 
-class GPT(pl.LightningModule):
+class GPT(torch.nn.Module):
 
     def __init__(
             self,
@@ -37,40 +37,52 @@ class GPT(pl.LightningModule):
             final_tokens=1000,
     ):
         super().__init__()
-
-        # auto creates self.hparams from the method signature
-        self.save_hyperparameters()
+        self.vocab_size = vocab_size
+        self.weight_decay = weight_decay
+        self.betas = betas
+        self.learning_rate = learning_rate
+        self.n_embd = n_embd
+        self.block_size = block_size
+        self.n_layer = n_layer
+        self.n_head = n_head
+        self.resid_pdrop = resid_pdrop
+        self.attn_pdrop = attn_pdrop
+        self.mlp_pdrop = mlp_pdrop
+        self.attention = attention
+        self.hidden_layer_multiplier = hidden_layer_multiplier
+        self.warmup_tokens = warmup_tokens
+        self.final_tokens = final_tokens
 
         # A list of the encoder or decoder blocks which constitute the Transformer.
         xformer_config = [
             {
                 "reversible": False,  # Turn on to test the effect of using reversible layers
                 "block_type": "encoder",
-                "num_layers": self.hparams.n_layer,
-                "dim_model": self.hparams.n_embd,
+                "num_layers": self.n_layer,
+                "dim_model": self.n_embd,
                 "layer_norm_style": "pre",
                 "position_encoding_config": {
                     "name": "vocab",
-                    "seq_len": self.hparams.block_size,
-                    "vocab_size": self.hparams.vocab_size,
+                    "seq_len": self.block_size,
+                    "vocab_size": self.vocab_size,
                 },
                 "multi_head_config": {
-                    "num_heads": self.hparams.n_head,
-                    "residual_dropout": self.hparams.resid_pdrop,
+                    "num_heads": self.n_head,
+                    "residual_dropout": self.resid_pdrop,
                     "use_rotary_embeddings": True,
                     "attention": {
-                        "name": self.hparams.attention,
-                        "dropout": self.hparams.attn_pdrop,
+                        "name": self.attention,
+                        "dropout": self.attn_pdrop,
                         "causal": True,
-                        "seq_len": self.hparams.block_size,
-                        "num_rules": self.hparams.n_head,
+                        "seq_len": self.block_size,
+                        "num_rules": self.n_head,
                     },
                 },
                 "feedforward_config": {
                     "name": "FusedMLP",  # Use MLP if Triton is not available
-                    "dropout": self.hparams.mlp_pdrop,
+                    "dropout": self.mlp_pdrop,
                     "activation": "gelu",
-                    "hidden_layer_multiplier": self.hparams.hidden_layer_multiplier,
+                    "hidden_layer_multiplier": self.hidden_layer_multiplier,
                 },
             }
         ]
@@ -79,10 +91,10 @@ class GPT(pl.LightningModule):
         self.model = xFormer.from_config(config)
 
         # decoder head
-        self.ln_f = nn.LayerNorm(self.hparams.n_embd)
-        self.head = nn.Linear(self.hparams.n_embd, self.hparams.vocab_size, bias=False)
+        self.ln_f = nn.LayerNorm(self.n_embd)
+        self.head = nn.Linear(self.n_embd, self.vocab_size, bias=False)
 
-        self.block_size = self.hparams.block_size
+        self.block_size = self.block_size
         self.apply(self._init_weights)
 
         self._tokens_seen = 0
@@ -99,9 +111,6 @@ class GPT(pl.LightningModule):
         # Reset the token counter
         self._tokens_seen = 0
 
-    def get_block_size(self):
-        return self.block_size
-
     def configure_optimizers(self):
         # Create the optimizer and the training schedule:
         # - Handle the per-param weight decay
@@ -113,79 +122,55 @@ class GPT(pl.LightningModule):
             p for n, p in self.named_parameters() if any(nd in n for nd in no_decay)
         ]
         optim_groups = [
-            {"params": params_decay, "weight_decay": self.hparams.weight_decay},
+            {"params": params_decay, "weight_decay": self.weight_decay},
             {"params": params_nodecay, "weight_decay": 0.0},
         ]
 
         # - Start with a warm up, ramp up then cosine
-        optimizer = torch.optim.AdamW(
-            optim_groups, lr=self.hparams.learning_rate, betas=self.hparams.betas
+        optimizer = FusedAdam(
+            optim_groups, lr=self.learning_rate, betas=self.betas
         )
 
         def update_lr(*_):
-            config = self.hparams
 
-            if self._tokens_seen < config.warmup_tokens:
+            if self._tokens_seen < self.warmup_tokens:
                 # linear warmup
-                lr_mult = float(self._tokens_seen) / float(max(1, config.warmup_tokens))
+                lr_mult = float(self._tokens_seen) / float(max(1, self.warmup_tokens))
                 lr_mult = max(lr_mult, 1e-2)  # could be that we've not seen any yet
             else:
                 # cosine learning rate decay
-                progress = float(self._tokens_seen - config.warmup_tokens) / float(
-                    max(1, config.final_tokens - config.warmup_tokens)
+                progress = float(self._tokens_seen - self.warmup_tokens) / float(
+                    max(1, self.final_tokens - self.warmup_tokens)
                 )
                 lr_mult = max(0.1, 0.5 * (1.0 + math.cos(math.pi * progress)))
 
             return lr_mult
 
-        lr_scheduler = {
-            "scheduler": torch.optim.lr_scheduler.LambdaLR(
-                optimizer,
-                lr_lambda=[update_lr, update_lr],
-            ),
-            "name": "learning_rate",
-            "interval": "step",  # The unit of the scheduler's step size
-            "frequency": 1,  # The frequency of the scheduler
-        }
-        return [optimizer], [lr_scheduler]
+        lr_scheduler = torch.optim.lr_scheduler.LambdaLR(
+            optimizer,
+            lr_lambda=[update_lr, update_lr],
+        )
+        return optimizer, lr_scheduler
 
-    def forward(self, src):
+    def forward(self, batch):
+        src, targets = batch
+
+        # Update the tokens we've seen (tracked for LR scheduling)
+        self._tokens_seen += (src >= 0).numel()
+
         # predict the next tokens (in latent space)
         prediction = self.model(src)
 
         # translate the predictions into tokens
         prediction = self.ln_f(prediction)
         logits = self.head(prediction)
-
-        return logits
-
-    def training_step(self, batch, _):
-        src, targets = batch
-
-        # Update the tokens we've seen (tracked for LR scheduling)
-        self._tokens_seen += (src >= 0).numel()
-
-        # same action as inference
-        logits = self(src)
-
-        loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1))
-
-        self.logger.log_metrics(
-            {
-                "train_loss": loss.mean(),
-                "learning_rate": self.lr_schedulers().get_last_lr()[0],
-            },
-            step=self.trainer.global_step,
-        )
-
-        return loss
+        return F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1))
 
 
 class CharDataset(Dataset):
     def __init__(self, data, block_size):
         chars = list(set(data))
         data_size, vocab_size = len(data), len(chars)
-        rank_zero_info("data has %d characters, %d unique." % (data_size, vocab_size))
 
         self.stoi = {ch: i for i, ch in enumerate(chars)}
         self.itos = {i: ch for i, ch in enumerate(chars)}
@@ -214,41 +199,6 @@ class CharDataset(Dataset):
         return "".join([self.itos[int(i)] for i in tokens])
 
 
-class DeepSpeedProfiler(Callback):
-
-    def __init__(self, start_idx: int = 20, end_idx: int = 40):
-        self.start_idx = start_idx
-        self.end_idx = end_idx
-
-        self.prof = None
-
-    def on_train_batch_start(
-        self,
-        trainer: "pl.Trainer",
-        pl_module: "pl.LightningModule",
-        batch: Any,
-        batch_idx: int,
-        unused: int = 0,
-    ) -> None:
-        if trainer.is_global_zero:
-            if self.prof is None:
-                self.prof = FlopsProfiler(pl_module)
-            if batch_idx == self.start_idx:
-                self.prof.start_profile()
-
-    def on_train_batch_end(
-        self,
-        trainer: "pl.Trainer",
-        pl_module: "pl.LightningModule",
-        outputs,
-        batch: Any,
-        batch_idx: int,
-        unused: int = 0,
-    ) -> None:
-        if trainer.is_global_zero and (batch_idx == self.end_idx):
-            self.prof.print_model_profile(batch_idx, detailed=False)
-
-
 def main(
         accumulate_batch_size: int = 2,
         batch_size: int = 2,
@@ -256,13 +206,28 @@ def main(
         epochs: int = 1,
         block_size: int = 2048,
         warmup: int = 20,
-        devices: int = 1,
-        precision: Union[str, int] = 16,
+        start_idx: int = 20,
+        end_idx: int = 40,
+        logging_level: int = logging.WARN,
         n_layer: int = 14,
         n_head: int = 16,
         n_embd: int = 2048
 ):
     seed_everything(42)
+    deepspeed.init_distributed()
+    deepspeed.utils.logging.logger.setLevel(logging_level)
+
+    local_rank = int(os.environ['LOCAL_RANK'])
+    local_rank_zero = local_rank == 0
+    root_device = torch.device(f"cuda:{local_rank}")
+
+    def print_fn(*args):
+        if local_rank_zero:
+            pprint(*args)
+
+    print = print_fn
+
+    torch.cuda.set_device(root_device)
 
     if not os.path.exists("input.txt"):
         os.system(
@@ -290,20 +255,55 @@ def main(
         n_embd=n_embd,
     )
 
-    trainer = Trainer(
-        accelerator='gpu',
-        devices=devices,
-        strategy=DeepSpeedStrategy(stage=2),
-        callbacks=DeepSpeedProfiler(),
-        limit_train_batches=50,
-        max_epochs=epochs,
-        precision=precision,
-        gradient_clip_val=1,  # Use to catch divergent gradients, if experimenting
-        log_every_n_steps=1,
-        accumulate_grad_batches=accumulate_batch_size // batch_size,
+    optimizer, scheduler = model.configure_optimizers()
+    model_parameters = filter(lambda p: p.requires_grad, model.parameters())
+
+    config = {
+        "gradient_accumulation_steps": accumulate_batch_size // batch_size,
+        "fp16": {
+            "enabled": True
+        },
+        "train_micro_batch_size_per_gpu": accumulate_batch_size // batch_size,
+        "zero_allow_untested_optimizer": False,
+        "zero_optimization": {
+            "stage": 2,
+            "contiguous_gradients": True,
+            "overlap_comm": True,
+            "allgather_partitions": True,
+            "reduce_scatter": True,
+            "allgather_bucket_size": 2e8,
+            "reduce_bucket_size": 2e8,
+        }
+    }
+
+    deepspeed_engine, deepspeed_optimizer, _, _ = deepspeed.initialize(
+        args=argparse.Namespace(device_rank=root_device.index),
+        config=config,
+        model=model,
+        model_parameters=model_parameters,
+        optimizer=optimizer,
+        lr_scheduler=scheduler,
     )
 
-    trainer.fit(model, train_loader)
+    if local_rank_zero:
+        prof = FlopsProfiler(model)
+
+    data_length = len(train_loader)
+
+    for x, batch in enumerate(train_loader):
+        if x == start_idx and local_rank_zero:
+            prof.start_profile()
+        src, targets = batch
+        batch = (src.to(root_device), targets.to(root_device))
+        loss = deepspeed_engine(batch)
+        print(f"[{x}/{data_length}]: Loss: {loss}")
+        deepspeed_engine.backward(loss)
+        deepspeed_engine.step()
+
+        if x == end_idx and local_rank_zero:
+            prof.print_model_profile(x, detailed=False)
+            prof.end_profile()
+            break
 
 
 if __name__ == '__main__':
