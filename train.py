@@ -1,19 +1,21 @@
 import math
 import os
-from typing import Any, Union
+from typing import Union
 
 import fire
 import pytorch_lightning as pl
 import torch
 import torch.nn as nn
-from deepspeed.profiling.flops_profiler import FlopsProfiler
-from pytorch_lightning import Trainer, seed_everything, Callback
+from deepspeed.ops.adam import FusedAdam
+from pytorch_lightning import Trainer, seed_everything
 from pytorch_lightning.strategies import DeepSpeedStrategy
 from pytorch_lightning.utilities import rank_zero_info
 from torch.nn import functional as F
 from torch.utils.data import DataLoader, Dataset, RandomSampler
-
 from xformers.factory.model_factory import xFormer, xFormerConfig
+from xformers.triton import FusedLayerNorm, FusedLinear
+
+from profiler import DeepSpeedProfiler
 
 
 class GPT(pl.LightningModule):
@@ -35,11 +37,25 @@ class GPT(pl.LightningModule):
             hidden_layer_multiplier=4,
             warmup_tokens=20,
             final_tokens=1000,
+            sparse_block_size=128
     ):
         super().__init__()
 
         # auto creates self.hparams from the method signature
         self.save_hyperparameters()
+
+        attention_kwargs = {
+            "name": self.hparams.attention,
+            "dropout": self.hparams.attn_pdrop,
+            "causal": True,
+            "seq_len": self.hparams.block_size,
+            "num_rules": self.hparams.n_head,
+        }
+        if self.hparams.attention == "blocksparse":
+            blocks = block_size // self.hparams.sparse_block_size
+            layout = torch.tril(torch.ones([self.hparams.n_head, blocks, blocks], dtype=torch.bool))
+            attention_kwargs["layout"] = layout
+            attention_kwargs["block_size"] = self.hparams.sparse_block_size
 
         # A list of the encoder or decoder blocks which constitute the Transformer.
         xformer_config = [
@@ -58,16 +74,10 @@ class GPT(pl.LightningModule):
                     "num_heads": self.hparams.n_head,
                     "residual_dropout": self.hparams.resid_pdrop,
                     "use_rotary_embeddings": True,
-                    "attention": {
-                        "name": self.hparams.attention,
-                        "dropout": self.hparams.attn_pdrop,
-                        "causal": True,
-                        "seq_len": self.hparams.block_size,
-                        "num_rules": self.hparams.n_head,
-                    },
+                    "attention": attention_kwargs
                 },
                 "feedforward_config": {
-                    "name": "FusedMLP",  # Use MLP if Triton is not available
+                    "name": "FusedMLP",
                     "dropout": self.hparams.mlp_pdrop,
                     "activation": "gelu",
                     "hidden_layer_multiplier": self.hparams.hidden_layer_multiplier,
@@ -79,8 +89,8 @@ class GPT(pl.LightningModule):
         self.model = xFormer.from_config(config)
 
         # decoder head
-        self.ln_f = nn.LayerNorm(self.hparams.n_embd)
-        self.head = nn.Linear(self.hparams.n_embd, self.hparams.vocab_size, bias=False)
+        self.ln_f = FusedLayerNorm(self.hparams.n_embd)
+        self.head = FusedLinear(self.hparams.n_embd, self.hparams.vocab_size, bias=False)
 
         self.block_size = self.hparams.block_size
         self.apply(self._init_weights)
@@ -118,7 +128,7 @@ class GPT(pl.LightningModule):
         ]
 
         # - Start with a warm up, ramp up then cosine
-        optimizer = torch.optim.AdamW(
+        optimizer = FusedAdam(
             optim_groups, lr=self.hparams.learning_rate, betas=self.hparams.betas
         )
 
@@ -214,41 +224,6 @@ class CharDataset(Dataset):
         return "".join([self.itos[int(i)] for i in tokens])
 
 
-class DeepSpeedProfiler(Callback):
-
-    def __init__(self, start_idx: int = 20, end_idx: int = 40):
-        self.start_idx = start_idx
-        self.end_idx = end_idx
-
-        self.prof = None
-
-    def on_train_batch_start(
-        self,
-        trainer: "pl.Trainer",
-        pl_module: "pl.LightningModule",
-        batch: Any,
-        batch_idx: int,
-        unused: int = 0,
-    ) -> None:
-        if trainer.is_global_zero:
-            if self.prof is None:
-                self.prof = FlopsProfiler(pl_module)
-            if batch_idx == self.start_idx:
-                self.prof.start_profile()
-
-    def on_train_batch_end(
-        self,
-        trainer: "pl.Trainer",
-        pl_module: "pl.LightningModule",
-        outputs,
-        batch: Any,
-        batch_idx: int,
-        unused: int = 0,
-    ) -> None:
-        if trainer.is_global_zero and (batch_idx == self.end_idx):
-            self.prof.print_model_profile(batch_idx, detailed=False)
-
-
 def main(
         accumulate_batch_size: int = 2,
         batch_size: int = 2,
@@ -260,7 +235,9 @@ def main(
         precision: Union[str, int] = 16,
         n_layer: int = 14,
         n_head: int = 16,
-        n_embd: int = 2048
+        n_embd: int = 2048,
+        attention: str = "scaled_dot_product",
+        sparse_block_size: int = 128,
 ):
     seed_everything(42)
 
@@ -282,7 +259,8 @@ def main(
     model = GPT(
         vocab_size=train_dataset.vocab_size,
         block_size=train_dataset.block_size,
-        attention="scaled_dot_product",
+        attention=attention,
+        sparse_block_size=sparse_block_size,
         warmup_tokens=accumulate_batch_size * warmup,
         final_tokens=epochs * len(train_dataset) * block_size,
         n_layer=n_layer,
@@ -301,6 +279,7 @@ def main(
         gradient_clip_val=1,  # Use to catch divergent gradients, if experimenting
         log_every_n_steps=1,
         accumulate_grad_batches=accumulate_batch_size // batch_size,
+        enable_checkpointing=False
     )
 
     trainer.fit(model, train_loader)
