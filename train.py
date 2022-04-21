@@ -12,7 +12,7 @@ from pytorch_lightning.strategies import DeepSpeedStrategy
 from pytorch_lightning.utilities import rank_zero_info
 from torch.nn import functional as F
 from torch.utils.data import DataLoader, Dataset, RandomSampler
-from xformers.factory.model_factory import xFormer, xFormerConfig
+from xformers.factory import xFormerEncoderConfig, xFormerEncoderBlock
 from xformers.triton import FusedLayerNorm, FusedLinear
 
 from profiler import DeepSpeedProfiler
@@ -57,45 +57,52 @@ class GPT(pl.LightningModule):
             attention_kwargs["layout"] = layout
             attention_kwargs["block_size"] = self.hparams.sparse_block_size
 
-        # A list of the encoder or decoder blocks which constitute the Transformer.
-        xformer_config = [
-            {
-                "reversible": False,  # Turn on to test the effect of using reversible layers
-                "block_type": "encoder",
-                "num_layers": self.hparams.n_layer,
-                "dim_model": self.hparams.n_embd,
-                "layer_norm_style": "pre",
-                "position_encoding_config": {
-                    "name": "vocab",
-                    "seq_len": self.hparams.block_size,
-                    "vocab_size": self.hparams.vocab_size,
-                },
-                "multi_head_config": {
-                    "num_heads": self.hparams.n_head,
-                    "residual_dropout": self.hparams.resid_pdrop,
-                    "use_rotary_embeddings": True,
-                    "attention": attention_kwargs
-                },
-                "feedforward_config": {
-                    "name": "FusedMLP",
-                    "dropout": self.hparams.mlp_pdrop,
-                    "activation": "gelu",
-                    "hidden_layer_multiplier": self.hparams.hidden_layer_multiplier,
-                },
-            }
-        ]
+        config = {
+            "dim_model": self.hparams.n_embd,
+            "layer_norm_style": "pre",
+            "position_encoding_config": {
+                "name": "vocab",
+                "seq_len": self.hparams.block_size,
+                "vocab_size": self.hparams.vocab_size,
+            },
+            "multi_head_config": {
+                "num_heads": self.hparams.n_head,
+                "residual_dropout": self.hparams.resid_pdrop,
+                "use_rotary_embeddings": True,
+                "attention": attention_kwargs
+            },
+            "feedforward_config": {
+                "name": "FusedMLP",
+                "dropout": self.hparams.mlp_pdrop,
+                "activation": "gelu",
+                "hidden_layer_multiplier": self.hparams.hidden_layer_multiplier,
+            },
+        }
 
-        config = xFormerConfig(xformer_config)
-        self.model = xFormer.from_config(config)
-
-        # decoder head
-        self.ln_f = FusedLayerNorm(self.hparams.n_embd)
-        self.head = FusedLinear(self.hparams.n_embd, self.hparams.vocab_size, bias=False)
+        self.config = xFormerEncoderConfig(**config)
 
         self.block_size = self.hparams.block_size
         self.apply(self._init_weights)
 
         self._tokens_seen = 0
+
+    def configure_sharded_model(self) -> None:
+        blocks = []
+        for i in range(self.hparams.n_layer):
+            # Label where this layer is in the stack
+            # (for instance useful for the positional encoding, or late layer norm)
+            if i > 0:
+                self.config.layer_position.mark_not_first()
+            if i < self.config.num_layers - 1:
+                self.config.layer_position.mark_not_last()
+            blocks.append(xFormerEncoderBlock.from_config(self.config))
+
+        self.encoders = torch.nn.ModuleList(blocks)
+
+        # decoder head
+        self.ln_f = FusedLayerNorm(self.hparams.n_embd)
+        self.head = FusedLinear(self.hparams.n_embd, self.hparams.vocab_size, bias=False)
+
 
     def _init_weights(self, module):
         if isinstance(module, (nn.Linear, nn.Embedding)):
@@ -160,8 +167,12 @@ class GPT(pl.LightningModule):
         return [optimizer], [lr_scheduler]
 
     def forward(self, src):
-        # predict the next tokens (in latent space)
-        prediction = self.model(src)
+        # encode to latent space
+        encoders = self.encoders
+        prediction = src.clone()
+        for encoder in encoders:
+            # prediction = deepspeed.checkpointing.checkpoint(encoder, prediction)
+            prediction = encoder(prediction)
 
         # translate the predictions into tokens
         prediction = self.ln_f(prediction)
@@ -255,7 +266,6 @@ def main(
         num_workers=num_workers,
         pin_memory=True,
     )
-
     model = GPT(
         vocab_size=train_dataset.vocab_size,
         block_size=train_dataset.block_size,
@@ -271,7 +281,7 @@ def main(
     trainer = Trainer(
         accelerator='gpu',
         devices=devices,
-        strategy=DeepSpeedStrategy(stage=2),
+        strategy=DeepSpeedStrategy(stage=3),
         callbacks=DeepSpeedProfiler(),
         limit_train_batches=50,
         max_epochs=epochs,
