@@ -1,55 +1,41 @@
+import time
 from typing import Any
 
 import pytorch_lightning as pl
-import torch
-from deepspeed.profiling.flops_profiler import FlopsProfiler, MODULE_HOOK_MAPPING
 from pytorch_lightning import Callback
-from xformers.components.attention import BlockSparseAttention
-from xformers.triton import FusedLayerNorm, FusedLinear
+from pytorch_lightning.utilities import rank_zero_info
 
 
-def _layer_norm_forward_hook(layer_norm_module: FusedLayerNorm, input, output):
-    input = input[0]
-    has_affine = layer_norm_module.weight is not None
-    flops = torch.numel(input) * (5 if has_affine else 4)
-    layer_norm_module.__flops__ += int(flops)
+class GPTFLOPsEstimate(Callback):
+    """
+    This callback wraps the function described in the Megatron-lm paper and the BigScience README
+    to calculate the lower bound estimated FLOPs for a GPT model:
 
+    https://arxiv.org/abs/2104.04473
+    https://github.com/bigscience-workshop/bigscience/tree/master/math#calculate-tflops
+    https://github.com/bigscience-workshop/bigscience/blob/master/experiments/gpt2-utils.md#calculate-model-size
+    """
 
-def _linear_forward_hook(linear_module: FusedLinear, input, output):
-    input = input[0]
-    out_features = linear_module.weight.shape[0]
-    macs = torch.numel(input) * out_features
-    flops = 2 * macs
-    linear_module.__flops__ += int(flops)
-
-
-def _block_sparse_forward_hook(sparse_attention: BlockSparseAttention, input, output):
-    q, k, v = input
-    sparse_att_mat_flops = torch.prod(torch.tensor(q.shape)) * k.shape[-1]
-    q_k_shape = torch.tensor([q.shape[0], q.shape[1], q.shape[2], q.shape[2]])
-    softmax_flops = torch.prod(q_k_shape)
-    a_flops = torch.prod(q_k_shape) * v.shape[-1]
-    flops = sparse_att_mat_flops + softmax_flops + a_flops
-    sparse_attention.__flops__ += int(flops)
-
-
-# these are additional hooks that the profiler needs to properly profile these modules.
-# since they are custom (not native pytorch modules) they need to be defined.
-ADDITIONAL_MODULE_HOOK_MAPPING = {
-    FusedLayerNorm: _layer_norm_forward_hook,
-    FusedLinear: _linear_forward_hook,
-    BlockSparseAttention: _block_sparse_forward_hook
-}
-
-
-class DeepSpeedProfiler(Callback):
-
-    def __init__(self, start_idx: int = 20, end_idx: int = 40):
-        MODULE_HOOK_MAPPING.update(ADDITIONAL_MODULE_HOOK_MAPPING)
+    def __init__(self,
+                 global_batch_size: int,
+                 hidden_size: int,
+                 n_layer: int,
+                 block_size: int,
+                 vocab_size: int,
+                 activation_checkpointing: bool = False,
+                 start_idx: int = 20,
+                 end_idx: int = 40):
         self.start_idx = start_idx
         self.end_idx = end_idx
+        self.global_batch_size = global_batch_size
+        self.activation_checkpointing = activation_checkpointing
+        h = hidden_size
+        l = n_layer
+        self.s = block_size
+        v = vocab_size
 
-        self.prof = None
+        self.num_parameters = (l * (12 * h ** 2 + 13 * h) + v * h + self.s * h + 2 * h) / 10 ** 9
+        print(f"Number of parameters: {self.num_parameters:.2f} Billion")
 
     def on_train_batch_start(
             self,
@@ -59,11 +45,8 @@ class DeepSpeedProfiler(Callback):
             batch_idx: int,
             unused: int = 0,
     ) -> None:
-        if trainer.is_global_zero:
-            if self.prof is None:
-                self.prof = FlopsProfiler(pl_module)
-            if batch_idx == self.start_idx:
-                self.prof.start_profile()
+        if trainer.is_global_zero and batch_idx == self.start_idx:
+            self.start = time.time()
 
     def on_train_batch_end(
             self,
@@ -75,4 +58,12 @@ class DeepSpeedProfiler(Callback):
             unused: int = 0,
     ) -> None:
         if trainer.is_global_zero and (batch_idx == self.end_idx):
-            self.prof.print_model_profile(batch_idx, detailed=False)
+            total_time = time.time() - self.start
+            factor = 4 if self.activation_checkpointing else 3
+            num_steps = self.end_idx - self.start_idx
+            per_iteration_time = total_time / num_steps
+            gpus = trainer.devices
+            flops = self.num_parameters * factor * 2 * self.s * self.global_batch_size
+            rank_zero_info(f"FLOPS {flops}")
+            flops = flops / (per_iteration_time * gpus * 1e3)
+            rank_zero_info(f"Estimates: {flops:.2f}TFLOPs Avg Iteration Time: {per_iteration_time:.2f}s")

@@ -8,14 +8,14 @@ import torch
 import torch.nn as nn
 from deepspeed.ops.adam import FusedAdam
 from pytorch_lightning import Trainer, seed_everything
-from pytorch_lightning.strategies import DeepSpeedStrategy
 from pytorch_lightning.utilities import rank_zero_info
 from torch.nn import functional as F
 from torch.utils.data import DataLoader, Dataset, RandomSampler
 from xformers.factory import xFormerEncoderConfig, xFormerEncoderBlock
 from xformers.triton import FusedLayerNorm, FusedLinear
 
-from profiler import DeepSpeedProfiler
+from memory import CUDAMemoryCallback
+from profiler import GPTFLOPsEstimate
 
 
 class GPT(pl.LightningModule):
@@ -234,10 +234,9 @@ class CharDataset(Dataset):
     def from_tokens(self, tokens):
         return "".join([self.itos[int(i)] for i in tokens])
 
-
 def main(
-        accumulate_batch_size: int = 2,
-        batch_size: int = 2,
+        batch_size_per_gpu: int = 2,
+        accumulate_grad_batches: int = 1,
         num_workers: int = 4,
         epochs: int = 1,
         block_size: int = 2048,
@@ -249,6 +248,7 @@ def main(
         n_embd: int = 2048,
         attention: str = "scaled_dot_product",
         sparse_block_size: int = 128,
+        strategy: str = "deepspeed_stage_3"
 ):
     seed_everything(42)
 
@@ -259,10 +259,11 @@ def main(
 
     text = open("input.txt", "r").read()
     train_dataset = CharDataset(text, block_size)
+    global_batch_size = batch_size_per_gpu * devices
     train_loader = DataLoader(
         train_dataset,
         sampler=RandomSampler(train_dataset),
-        batch_size=batch_size,
+        batch_size=batch_size_per_gpu,
         num_workers=num_workers,
         pin_memory=True,
     )
@@ -271,28 +272,41 @@ def main(
         block_size=train_dataset.block_size,
         attention=attention,
         sparse_block_size=sparse_block_size,
-        warmup_tokens=accumulate_batch_size * warmup,
+        warmup_tokens=global_batch_size * warmup,
         final_tokens=epochs * len(train_dataset) * block_size,
         n_layer=n_layer,
         n_head=n_head,
         n_embd=n_embd,
     )
 
+    rank_zero_info(f"Parameters: {(sum(param.numel() for param in model.parameters()) / 1e9):.2f}Billion")
+
     trainer = Trainer(
         accelerator='gpu',
         devices=devices,
-        strategy=DeepSpeedStrategy(stage=3),
-        callbacks=DeepSpeedProfiler(),
+        strategy=strategy,
+        callbacks=[
+            GPTFLOPsEstimate(
+                global_batch_size=global_batch_size,
+                hidden_size=n_embd,
+                n_layer=n_layer,
+                block_size=block_size,
+                vocab_size=train_dataset.vocab_size,
+                activation_checkpointing=False
+            ),
+            CUDAMemoryCallback(),
+        ],
         limit_train_batches=50,
         max_epochs=epochs,
         precision=precision,
-        gradient_clip_val=1,  # Use to catch divergent gradients, if experimenting
+        # gradient_clip_val=1,  # Use to catch divergent gradients, if experimenting
         log_every_n_steps=1,
-        accumulate_grad_batches=accumulate_batch_size // batch_size,
+        accumulate_grad_batches=accumulate_grad_batches,
         enable_checkpointing=False
     )
 
     trainer.fit(model, train_loader)
+
 
 
 if __name__ == '__main__':
