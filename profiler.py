@@ -23,10 +23,10 @@ class GPTFLOPsEstimate(Callback):
                  block_size: int,
                  vocab_size: int,
                  activation_checkpointing: bool = False,
-                 start_idx: int = 20,
-                 end_idx: int = 40):
-        self.start_idx = start_idx
-        self.end_idx = end_idx
+                 profile_start_step: int = 20,
+                 profile_num_steps: int = 40):
+        self.profile_start_step = profile_start_step
+        self.profile_num_steps = profile_num_steps
         self.global_batch_size = global_batch_size
         self.activation_checkpointing = activation_checkpointing
         h = hidden_size
@@ -45,8 +45,12 @@ class GPTFLOPsEstimate(Callback):
             batch_idx: int,
             unused: int = 0,
     ) -> None:
-        if trainer.is_global_zero and batch_idx == self.start_idx:
+        if trainer.is_global_zero and batch_idx == self.profile_start_step:
             self.start = time.time()
+
+    @property
+    def num_steps(self):
+        return self.profile_num_steps + self.profile_start_step
 
     def on_train_batch_end(
             self,
@@ -57,13 +61,12 @@ class GPTFLOPsEstimate(Callback):
             batch_idx: int,
             unused: int = 0,
     ) -> None:
-        if trainer.is_global_zero and (batch_idx == self.end_idx):
+        if trainer.is_global_zero and (batch_idx == self.num_steps):
             total_time = time.time() - self.start
             factor = 4 if self.activation_checkpointing else 3
-            num_steps = self.end_idx - self.start_idx
+            num_steps = self.profile_num_steps - self.profile_start_step
             per_iteration_time = total_time / num_steps
             gpus = trainer.devices
             flops = self.num_parameters * factor * 2 * self.s * self.global_batch_size
-            rank_zero_info(f"FLOPS {flops}")
             flops = flops / (per_iteration_time * gpus * 1e3)
             rank_zero_info(f"Estimates: {flops:.2f}TFLOPs Avg Iteration Time: {per_iteration_time:.2f}s")

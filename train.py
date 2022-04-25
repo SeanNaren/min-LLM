@@ -8,6 +8,7 @@ import torch
 import torch.nn as nn
 from deepspeed.ops.adam import FusedAdam
 from pytorch_lightning import Trainer, seed_everything
+from pytorch_lightning.strategies import DeepSpeedStrategy
 from pytorch_lightning.utilities import rank_zero_info
 from torch.nn import functional as F
 from torch.utils.data import DataLoader, Dataset, RandomSampler
@@ -82,7 +83,6 @@ class GPT(pl.LightningModule):
         self.config = xFormerEncoderConfig(**config)
 
         self.block_size = self.hparams.block_size
-        self.apply(self._init_weights)
 
         self._tokens_seen = 0
 
@@ -102,6 +102,9 @@ class GPT(pl.LightningModule):
         # decoder head
         self.ln_f = FusedLayerNorm(self.hparams.n_embd)
         self.head = FusedLinear(self.hparams.n_embd, self.hparams.vocab_size, bias=False)
+
+        # todo: when using model parallelism, this may be wrong. will need to redo
+        self.apply(self._init_weights)
 
 
     def _init_weights(self, module):
@@ -234,6 +237,7 @@ class CharDataset(Dataset):
     def from_tokens(self, tokens):
         return "".join([self.itos[int(i)] for i in tokens])
 
+
 def main(
         batch_size_per_gpu: int = 2,
         accumulate_grad_batches: int = 1,
@@ -248,7 +252,7 @@ def main(
         n_embd: int = 2048,
         attention: str = "scaled_dot_product",
         sparse_block_size: int = 128,
-        strategy: str = "deepspeed_stage_3"
+        stage: int = 3
 ):
     seed_everything(42)
 
@@ -260,6 +264,18 @@ def main(
     text = open("input.txt", "r").read()
     train_dataset = CharDataset(text, block_size)
     global_batch_size = batch_size_per_gpu * devices
+    config = {
+        "zero_allow_untested_optimizer": True,
+        "zero_optimization": {
+            "stage": stage,
+            "contiguous_gradients": True,
+            "overlap_comm": True,
+            "allgather_partitions": True,
+            "reduce_scatter": True,
+        },
+        "train_micro_batch_size_per_gpu": batch_size_per_gpu
+    }
+
     train_loader = DataLoader(
         train_dataset,
         sampler=RandomSampler(train_dataset),
@@ -278,13 +294,10 @@ def main(
         n_head=n_head,
         n_embd=n_embd,
     )
-
-    rank_zero_info(f"Parameters: {(sum(param.numel() for param in model.parameters()) / 1e9):.2f}Billion")
-
     trainer = Trainer(
         accelerator='gpu',
         devices=devices,
-        strategy=strategy,
+        strategy=DeepSpeedStrategy(config=config),
         callbacks=[
             GPTFLOPsEstimate(
                 global_batch_size=global_batch_size,
@@ -306,7 +319,6 @@ def main(
     )
 
     trainer.fit(model, train_loader)
-
 
 
 if __name__ == '__main__':

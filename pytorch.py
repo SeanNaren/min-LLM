@@ -2,6 +2,7 @@ import argparse
 import logging
 import math
 import os
+import time
 from pprint import pprint
 
 import deepspeed
@@ -9,11 +10,11 @@ import fire
 import torch
 import torch.nn as nn
 from deepspeed.ops.adam import FusedAdam
-from deepspeed.profiling.flops_profiler import FlopsProfiler
 from pytorch_lightning import seed_everything
 from torch.nn import functional as F
-from torch.utils.data import DataLoader, Dataset, RandomSampler
-from xformers.factory.model_factory import xFormer, xFormerConfig
+from torch.utils.data import DataLoader, Dataset, DistributedSampler
+from xformers.factory import xFormerEncoderConfig, xFormerEncoderBlock
+from xformers.triton import FusedLayerNorm, FusedLinear
 
 
 class GPT(torch.nn.Module):
@@ -35,6 +36,8 @@ class GPT(torch.nn.Module):
             hidden_layer_multiplier=4,
             warmup_tokens=20,
             final_tokens=1000,
+            sparse_block_size=128,
+            local_rank=0,
     ):
         super().__init__()
         self.vocab_size = vocab_size
@@ -49,55 +52,71 @@ class GPT(torch.nn.Module):
         self.attn_pdrop = attn_pdrop
         self.mlp_pdrop = mlp_pdrop
         self.attention = attention
+        self.sparse_block_size = sparse_block_size
         self.hidden_layer_multiplier = hidden_layer_multiplier
         self.warmup_tokens = warmup_tokens
         self.final_tokens = final_tokens
 
-        # A list of the encoder or decoder blocks which constitute the Transformer.
-        xformer_config = [
-            {
-                "reversible": False,  # Turn on to test the effect of using reversible layers
-                "block_type": "encoder",
-                "num_layers": self.n_layer,
-                "dim_model": self.n_embd,
-                "layer_norm_style": "pre",
-                "position_encoding_config": {
-                    "name": "vocab",
-                    "seq_len": self.block_size,
-                    "vocab_size": self.vocab_size,
-                },
-                "multi_head_config": {
-                    "num_heads": self.n_head,
-                    "residual_dropout": self.resid_pdrop,
-                    "use_rotary_embeddings": True,
-                    "attention": {
-                        "name": self.attention,
-                        "dropout": self.attn_pdrop,
-                        "causal": True,
-                        "seq_len": self.block_size,
-                        "num_rules": self.n_head,
-                    },
-                },
-                "feedforward_config": {
-                    "name": "FusedMLP",  # Use MLP if Triton is not available
-                    "dropout": self.mlp_pdrop,
-                    "activation": "gelu",
-                    "hidden_layer_multiplier": self.hidden_layer_multiplier,
-                },
-            }
-        ]
+        attention_kwargs = {
+            "name": self.attention,
+            "dropout": self.attn_pdrop,
+            "causal": True,
+            "seq_len": self.block_size,
+            "num_rules": self.n_head,
+        }
+        if self.attention == "blocksparse":
+            blocks = block_size // self.sparse_block_size
+            layout = torch.tril(torch.ones([self.n_head, blocks, blocks], dtype=torch.bool))
+            attention_kwargs["layout"] = layout
+            attention_kwargs["block_size"] = self.sparse_block_size
 
-        config = xFormerConfig(xformer_config)
-        self.model = xFormer.from_config(config)
+        config = {
+            "dim_model": self.n_embd,
+            "layer_norm_style": "pre",
+            "position_encoding_config": {
+                "name": "vocab",
+                "seq_len": self.block_size,
+                "vocab_size": self.vocab_size,
+            },
+            "multi_head_config": {
+                "num_heads": self.n_head,
+                "residual_dropout": self.resid_pdrop,
+                "use_rotary_embeddings": True,
+                "attention": attention_kwargs
+            },
+            "feedforward_config": {
+                "name": "FusedMLP",
+                "dropout": self.mlp_pdrop,
+                "activation": "gelu",
+                "hidden_layer_multiplier": self.hidden_layer_multiplier,
+            },
+        }
 
-        # decoder head
-        self.ln_f = nn.LayerNorm(self.n_embd)
-        self.head = nn.Linear(self.n_embd, self.vocab_size, bias=False)
+        self.config = xFormerEncoderConfig(**config)
 
         self.block_size = self.block_size
-        self.apply(self._init_weights)
 
         self._tokens_seen = 0
+
+        blocks = []
+        for i in range(self.n_layer):
+            # Label where this layer is in the stack
+            # (for instance useful for the positional encoding, or late layer norm)
+            if i > 0:
+                self.config.layer_position.mark_not_first()
+            if i < self.config.num_layers - 1:
+                self.config.layer_position.mark_not_last()
+            blocks.append(xFormerEncoderBlock.from_config(self.config))
+
+        self.encoders = torch.nn.ModuleList(blocks)
+
+        # decoder head
+        self.ln_f = FusedLayerNorm(self.n_embd)
+        self.head = FusedLinear(self.n_embd, self.vocab_size, bias=False)
+
+        # todo: when using model parallelism, this may be wrong. will need to redo
+        self.apply(self._init_weights)
+
 
     def _init_weights(self, module):
         if isinstance(module, (nn.Linear, nn.Embedding)):
@@ -154,16 +173,17 @@ class GPT(torch.nn.Module):
 
     def forward(self, batch):
         src, targets = batch
-
-        # Update the tokens we've seen (tracked for LR scheduling)
-        self._tokens_seen += (src >= 0).numel()
-
-        # predict the next tokens (in latent space)
-        prediction = self.model(src)
+        # encode to latent space
+        encoders = self.encoders
+        prediction = src.clone()
+        for encoder in encoders:
+            # prediction = deepspeed.checkpointing.checkpoint(encoder, prediction)
+            prediction = encoder(prediction)
 
         # translate the predictions into tokens
         prediction = self.ln_f(prediction)
         logits = self.head(prediction)
+
         return F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1))
 
 
@@ -199,33 +219,78 @@ class CharDataset(Dataset):
         return "".join([self.itos[int(i)] for i in tokens])
 
 
+class Profiler:
+    def __init__(self,
+                 global_batch_size: int,
+                 hidden_size: int,
+                 num_devices: int,
+                 device: torch.device,
+                 n_layer: int,
+                 block_size: int,
+                 vocab_size: int,
+                 activation_checkpointing: bool = False):
+        self.global_batch_size = global_batch_size
+        self.activation_checkpointing = activation_checkpointing
+        self.num_devices = num_devices
+        self.device = device
+        h = hidden_size
+        l = n_layer
+        self.s = block_size
+        v = vocab_size
+
+        self.num_parameters = (l * (12 * h ** 2 + 13 * h) + v * h + self.s * h + 2 * h) / 10 ** 9
+        print(f"Number of parameters: {self.num_parameters:.2f} Billion")
+
+        torch.cuda.reset_peak_memory_stats(self.device)
+        torch.cuda.synchronize(self.device)
+
+    def start_profiling(self):
+        self.start = time.time()
+
+    def end_profiling(self, num_steps) -> None:
+        total_time = time.time() - self.start
+        factor = 4 if self.activation_checkpointing else 3
+        per_iteration_time = total_time / num_steps
+        flops = self.num_parameters * factor * 2 * self.s * self.global_batch_size
+        flops = flops / (per_iteration_time * self.num_devices * 1e3)
+        print(f"Estimates: {flops:.2f}TFLOPs Avg Iteration Time: {per_iteration_time:.2f}s")
+
+        torch.cuda.synchronize(self.device)
+        max_memory = torch.cuda.max_memory_allocated(self.device) / 2 ** 20
+        print(f"Average Peak CUDA memory {max_memory:.2f} MiB")
+
+
 def main(
-        accumulate_batch_size: int = 2,
-        batch_size: int = 2,
+        batch_size_per_gpu: int = 2,
+        accumulate_grad_batches: int = 1,
         num_workers: int = 4,
         epochs: int = 1,
         block_size: int = 2048,
         warmup: int = 20,
-        start_idx: int = 20,
-        end_idx: int = 40,
+        profile_start_step: int = 20,
+        profile_num_steps: int = 20,
         logging_level: int = logging.WARN,
         n_layer: int = 14,
         n_head: int = 16,
-        n_embd: int = 2048
+        n_embd: int = 2048,
+        attention: str = "scaled_dot_product",
+        sparse_block_size: int = 128,
+        stage: int = 3,
+        local_rank: int = 0,
 ):
-    seed_everything(42)
-    deepspeed.init_distributed()
-    deepspeed.utils.logging.logger.setLevel(logging_level)
-
-    local_rank = int(os.environ['LOCAL_RANK'])
-    local_rank_zero = local_rank == 0
-    root_device = torch.device(f"cuda:{local_rank}")
-
     def print_fn(*args):
         if local_rank_zero:
             pprint(*args)
 
     print = print_fn
+
+    seed_everything(42)
+    deepspeed.init_distributed()
+    deepspeed.utils.logging.logger.setLevel(logging_level)
+    local_rank = int(local_rank)
+    local_rank_zero = local_rank == 0
+    root_device = torch.device(f"cuda:{local_rank}")
+    num_devices = int(os.environ['WORLD_SIZE'])
 
     torch.cuda.set_device(root_device)
 
@@ -238,35 +303,37 @@ def main(
     train_dataset = CharDataset(text, block_size)
     train_loader = DataLoader(
         train_dataset,
-        sampler=RandomSampler(train_dataset),
-        batch_size=batch_size,
+        sampler=DistributedSampler(train_dataset),
+        batch_size=batch_size_per_gpu,
         num_workers=num_workers,
         pin_memory=True,
     )
 
+    global_batch_size = batch_size_per_gpu * num_devices
     model = GPT(
         vocab_size=train_dataset.vocab_size,
         block_size=train_dataset.block_size,
-        attention="scaled_dot_product",
-        warmup_tokens=accumulate_batch_size * warmup,
+        attention=attention,
+        warmup_tokens=global_batch_size * warmup,
         final_tokens=epochs * len(train_dataset) * block_size,
         n_layer=n_layer,
         n_head=n_head,
         n_embd=n_embd,
+        sparse_block_size=sparse_block_size,
     )
 
     optimizer, scheduler = model.configure_optimizers()
     model_parameters = filter(lambda p: p.requires_grad, model.parameters())
 
     config = {
-        "gradient_accumulation_steps": accumulate_batch_size // batch_size,
+        "gradient_accumulation_steps": accumulate_grad_batches,
         "fp16": {
             "enabled": True
         },
-        "train_micro_batch_size_per_gpu": accumulate_batch_size // batch_size,
+        "train_micro_batch_size_per_gpu": batch_size_per_gpu,
         "zero_allow_untested_optimizer": False,
         "zero_optimization": {
-            "stage": 2,
+            "stage": stage,
             "contiguous_gradients": True,
             "overlap_comm": True,
             "allgather_partitions": True,
@@ -286,13 +353,22 @@ def main(
     )
 
     if local_rank_zero:
-        prof = FlopsProfiler(model)
+        prof = Profiler(
+            global_batch_size=global_batch_size,
+            hidden_size=n_embd,
+            n_layer=n_layer,
+            block_size=block_size,
+            vocab_size=train_dataset.vocab_size,
+            activation_checkpointing=False,
+            num_devices=num_devices,
+            device=root_device,
+        )
 
     data_length = len(train_loader)
 
     for x, batch in enumerate(train_loader):
-        if x == start_idx and local_rank_zero:
-            prof.start_profile()
+        if x == profile_start_step and local_rank_zero:
+            prof.start_profiling()
         src, targets = batch
         batch = (src.to(root_device), targets.to(root_device))
         loss = deepspeed_engine(batch)
@@ -300,9 +376,8 @@ def main(
         deepspeed_engine.backward(loss)
         deepspeed_engine.step()
 
-        if x == end_idx and local_rank_zero:
-            prof.print_model_profile(x, detailed=False)
-            prof.end_profile()
+        if x == profile_start_step + profile_num_steps and local_rank_zero:
+            prof.end_profiling(profile_num_steps)
             break
 
 
