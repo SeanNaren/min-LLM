@@ -1,0 +1,4 @@
+pytorch-lightning
+deepspeed
+xformers
+fire
