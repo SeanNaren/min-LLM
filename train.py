@@ -299,7 +299,7 @@ def main(
         limit_train_batches=50,
         max_epochs=epochs,
         precision=precision,
-        # gradient_clip_val=1,  # Use to catch divergent gradients, if experimenting
+        gradient_clip_val=1,  # Use to catch divergent gradients, if experimenting
         log_every_n_steps=1,
         accumulate_grad_batches=accumulate_grad_batches,
         enable_checkpointing=False
