@@ -1,18 +1,19 @@
 import math
 import os
-from typing import Union
+from typing import Union, Optional
 
 import fire
 import pytorch_lightning as pl
 import torch
 import torch.nn as nn
 from deepspeed.ops.adam import FusedAdam
+from fairscale.nn import wrap
 from pytorch_lightning import Trainer, seed_everything
-from pytorch_lightning.strategies import DeepSpeedStrategy
+from pytorch_lightning.strategies import DDPFullyShardedStrategy
 from pytorch_lightning.utilities import rank_zero_info
 from torch.nn import functional as F
 from torch.utils.data import DataLoader, Dataset, RandomSampler
-from xformers.factory import xFormerEncoderConfig, xFormerEncoderBlock
+from xformers.factory import xFormerConfig, xFormer
 from xformers.triton import FusedLayerNorm, FusedLinear
 
 from memory import CUDAMemoryCallback
@@ -58,7 +59,10 @@ class GPT(pl.LightningModule):
             attention_kwargs["layout"] = layout
             attention_kwargs["block_size"] = self.hparams.sparse_block_size
 
-        config = {
+        config = [
+            {
+            "block_type": "encoder",
+            "num_layers": self.hparams.n_layer,
             "dim_model": self.hparams.n_embd,
             "layer_norm_style": "pre",
             "position_encoding_config": {
@@ -79,32 +83,23 @@ class GPT(pl.LightningModule):
                 "hidden_layer_multiplier": self.hparams.hidden_layer_multiplier,
             },
         }
+        ]
 
-        self.config = xFormerEncoderConfig(**config)
+        self.config = xFormerConfig(config)
 
         self.block_size = self.hparams.block_size
 
         self._tokens_seen = 0
 
     def configure_sharded_model(self) -> None:
-        blocks = []
-        for i in range(self.hparams.n_layer):
-            # Label where this layer is in the stack
-            # (for instance useful for the positional encoding, or late layer norm)
-            if i > 0:
-                self.config.layer_position.mark_not_first()
-            if i < self.config.num_layers - 1:
-                self.config.layer_position.mark_not_last()
-            blocks.append(xFormerEncoderBlock.from_config(self.config))
-
-        self.encoders = torch.nn.ModuleList(blocks)
+        self.model = wrap(xFormer.from_config(self.config), mixed_precision=True)
 
         # decoder head
         self.ln_f = FusedLayerNorm(self.hparams.n_embd)
         self.head = FusedLinear(self.hparams.n_embd, self.hparams.vocab_size, bias=False)
 
         # todo: when using model parallelism, this may be wrong. will need to redo
-        self.apply(self._init_weights)
+        # self.apply(self._init_weights)
 
 
     def _init_weights(self, module):
@@ -171,11 +166,7 @@ class GPT(pl.LightningModule):
 
     def forward(self, src):
         # encode to latent space
-        encoders = self.encoders
-        prediction = src.clone()
-        for encoder in encoders:
-            # prediction = deepspeed.checkpointing.checkpoint(encoder, prediction)
-            prediction = encoder(prediction)
+        prediction = self.model(src)
 
         # translate the predictions into tokens
         prediction = self.ln_f(prediction)
@@ -203,6 +194,17 @@ class GPT(pl.LightningModule):
         )
 
         return loss
+
+    def configure_gradient_clipping(
+            self,
+            optimizer,
+            optimizer_idx: int,
+            gradient_clip_val: Optional[Union[int, float]] = None,
+            gradient_clip_algorithm: Optional[str] = None,
+    ):
+        assert gradient_clip_algorithm == 'norm'
+        self.model.clip_grad_norm_(gradient_clip_val)
+
 
 
 class CharDataset(Dataset):
@@ -252,7 +254,6 @@ def main(
         n_embd: int = 2048,
         attention: str = "scaled_dot_product",
         sparse_block_size: int = 128,
-        stage: int = 3
 ):
     seed_everything(42)
 
@@ -264,17 +265,6 @@ def main(
     text = open("input.txt", "r").read()
     train_dataset = CharDataset(text, block_size)
     global_batch_size = batch_size_per_gpu * devices
-    config = {
-        "zero_allow_untested_optimizer": True,
-        "zero_optimization": {
-            "stage": stage,
-            "contiguous_gradients": True,
-            "overlap_comm": True,
-            "allgather_partitions": True,
-            "reduce_scatter": True,
-        },
-        "train_micro_batch_size_per_gpu": batch_size_per_gpu
-    }
 
     train_loader = DataLoader(
         train_dataset,
@@ -297,7 +287,7 @@ def main(
     trainer = Trainer(
         accelerator='gpu',
         devices=devices,
-        strategy=DeepSpeedStrategy(config=config),
+        strategy=DDPFullyShardedStrategy(),
         callbacks=[
             GPTFLOPsEstimate(
                 global_batch_size=global_batch_size,
