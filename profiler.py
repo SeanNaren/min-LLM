@@ -24,7 +24,7 @@ class GPTFLOPsEstimate(Callback):
                  vocab_size: int,
                  activation_checkpointing: bool = False,
                  profile_start_step: int = 20,
-                 profile_num_steps: int = 40):
+                 profile_num_steps: int = 20):
         self.profile_start_step = profile_start_step
         self.profile_num_steps = profile_num_steps
         self.global_batch_size = global_batch_size
@@ -49,7 +49,7 @@ class GPTFLOPsEstimate(Callback):
             self.start = time.time()
 
     @property
-    def num_steps(self):
+    def profile_end_step(self):
         return self.profile_num_steps + self.profile_start_step
 
     def on_train_batch_end(
@@ -61,10 +61,10 @@ class GPTFLOPsEstimate(Callback):
             batch_idx: int,
             unused: int = 0,
     ) -> None:
-        if trainer.is_global_zero and (batch_idx == self.num_steps):
+        if trainer.is_global_zero and (batch_idx == self.profile_end_step):
             total_time = time.time() - self.start
             factor = 4 if self.activation_checkpointing else 3
-            num_steps = self.profile_num_steps - self.profile_start_step
+            num_steps = self.profile_num_steps
             per_iteration_time = total_time / num_steps
             gpus = trainer.devices
             flops = self.num_parameters * factor * 2 * self.s * self.global_batch_size
