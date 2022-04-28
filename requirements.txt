@@ -1,4 +1,4 @@
-pytorch-lightning
+pytorch-lightning>=1.6.1
 deepspeed
 fire
 git+https://github.com/facebookresearch/xformers.git
