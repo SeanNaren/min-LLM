@@ -53,7 +53,7 @@ class GPT(pl.LightningModule):
             "num_rules": self.hparams.n_head,
         }
         if self.hparams.attention == "blocksparse":
-            blocks = block_size // self.hparams.sparse_block_size
+            blocks = self.hparams.block_size // self.hparams.sparse_block_size
             layout = torch.tril(torch.ones([self.hparams.n_head, blocks, blocks], dtype=torch.bool))
             attention_kwargs["layout"] = layout
             attention_kwargs["block_size"] = self.hparams.sparse_block_size
@@ -252,6 +252,7 @@ def main(
         n_embd: int = 2048,
         attention: str = "scaled_dot_product",
         sparse_block_size: int = 128,
+        strategy: str = "deepspeed",
         stage: int = 3
 ):
     seed_everything(42)
@@ -273,7 +274,9 @@ def main(
             "allgather_partitions": True,
             "reduce_scatter": True,
         },
-        "train_micro_batch_size_per_gpu": batch_size_per_gpu
+        "train_micro_batch_size_per_gpu": batch_size_per_gpu,
+        "bf16": {"enabled": precision == "bf16"},
+        "fp16": {"enabled": precision == 16}
     }
 
     train_loader = DataLoader(
@@ -297,7 +300,7 @@ def main(
     trainer = Trainer(
         accelerator='gpu',
         devices=devices,
-        strategy=DeepSpeedStrategy(config=config),
+        strategy=DeepSpeedStrategy(config=config) if strategy == 'deepspeed' else strategy,
         callbacks=[
             GPTFLOPsEstimate(
                 global_batch_size=global_batch_size,
@@ -312,7 +315,7 @@ def main(
         limit_train_batches=50,
         max_epochs=epochs,
         precision=precision,
-        gradient_clip_val=1,  # Use to catch divergent gradients, if experimenting
+        gradient_clip_val=1,
         log_every_n_steps=1,
         accumulate_grad_batches=accumulate_grad_batches,
         enable_checkpointing=False

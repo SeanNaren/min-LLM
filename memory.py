@@ -9,14 +9,14 @@ class CUDAMemoryCallback(Callback):
     def on_train_epoch_start(self, trainer, pl_module):
         # Reset the memory use counter
         torch.cuda.reset_peak_memory_stats(self.root_gpu(trainer))
-        torch.cuda.synchronize(trainer.root_gpu)
+        torch.cuda.synchronize(self.root_gpu(trainer))
 
     def root_gpu(self, trainer):
         return trainer.strategy.root_device.index
 
     def on_train_epoch_end(self, trainer, pl_module):
         torch.cuda.synchronize(self.root_gpu(trainer))
-        max_memory = torch.cuda.max_memory_allocated(trainer.root_gpu) / 2 ** 20
+        max_memory = torch.cuda.max_memory_allocated(self.root_gpu(trainer)) / 2 ** 20
         virt_mem = psutil.virtual_memory()
         virt_mem = round((virt_mem.used / (1024 ** 3)), 2)
         swap = psutil.swap_memory()
