@@ -66,7 +66,7 @@ class GPTFLOPsEstimate(Callback):
             factor = 4 if self.activation_checkpointing else 3
             num_steps = self.profile_num_steps
             per_iteration_time = total_time / num_steps
-            gpus = trainer.devices
+            gpus = trainer.num_devices
             flops = self.num_parameters * factor * 2 * self.s * self.global_batch_size
             flops = flops / (per_iteration_time * gpus * 1e3)
             rank_zero_info(f"Estimates: {flops:.2f}TFLOPs Avg Iteration Time: {per_iteration_time:.2f}s")

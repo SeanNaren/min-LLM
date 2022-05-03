@@ -22,9 +22,9 @@ class CUDAMemoryCallback(Callback):
         swap = psutil.swap_memory()
         swap = round((swap.used / (1024 ** 3)), 2)
 
-        max_memory = trainer.training_type_plugin.reduce(max_memory)
-        virt_mem = trainer.training_type_plugin.reduce(virt_mem)
-        swap = trainer.training_type_plugin.reduce(swap)
+        max_memory = trainer.strategy.reduce(max_memory)
+        virt_mem = trainer.strategy.reduce(virt_mem)
+        swap = trainer.strategy.reduce(swap)
 
         rank_zero_info(f"Average Peak CUDA memory {max_memory:.2f} MiB")
         rank_zero_info(f"Average Peak Virtual memory {virt_mem:.2f} GiB")
