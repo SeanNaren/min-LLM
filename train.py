@@ -13,11 +13,50 @@ from pytorch_lightning.strategies import DDPFullyShardedStrategy
 from pytorch_lightning.utilities import rank_zero_info
 from torch.nn import functional as F
 from torch.utils.data import DataLoader, Dataset, RandomSampler
-from xformers.factory import xFormerConfig, xFormer
+from xformers.factory import xFormerEncoderConfig, xFormerEncoderBlock
 from xformers.triton import FusedLayerNorm, FusedLinear
 
 from memory import CUDAMemoryCallback
 from profiler import GPTFLOPsEstimate
+
+
+class xFormerGPT(torch.nn.Module):
+    def __init__(self,
+                 config: xFormerEncoderConfig,
+                 n_embd: int,
+                 vocab_size: int,
+                 n_layer: int):
+        super().__init__()
+
+        blocks = []
+        for i in range(n_layer):
+            # Label where this layer is in the stack
+            # (for instance useful for the positional encoding, or late layer norm)
+            if i > 0:
+                config.layer_position.mark_not_first()
+            if i < config.num_layers - 1:
+                config.layer_position.mark_not_last()
+            block = wrap(xFormerEncoderBlock.from_config(config))
+            blocks.append(block)
+
+        self.encoders = torch.nn.ModuleList(blocks)
+
+        # decoder head
+        self.ln_f = FusedLayerNorm(n_embd)
+        self.head = FusedLinear(n_embd, vocab_size, bias=False)
+
+    def forward(self, src):
+        # encode to latent space
+        encoders = self.encoders
+        prediction = src.clone()
+        for encoder in encoders:
+            prediction = encoder(prediction)
+
+        # translate the predictions into tokens
+        prediction = self.ln_f(prediction)
+        logits = self.head(prediction)
+
+        return logits
 
 
 class GPT(pl.LightningModule):
@@ -59,10 +98,7 @@ class GPT(pl.LightningModule):
             attention_kwargs["layout"] = layout
             attention_kwargs["block_size"] = self.hparams.sparse_block_size
 
-        config = [
-            {
-            "block_type": "encoder",
-            "num_layers": self.hparams.n_layer,
+        config = {
             "dim_model": self.hparams.n_embd,
             "layer_norm_style": "pre",
             "position_encoding_config": {
@@ -83,24 +119,25 @@ class GPT(pl.LightningModule):
                 "hidden_layer_multiplier": self.hparams.hidden_layer_multiplier,
             },
         }
-        ]
 
-        self.config = xFormerConfig(config)
+        self.config = xFormerEncoderConfig(**config)
 
         self.block_size = self.hparams.block_size
 
         self._tokens_seen = 0
 
     def configure_sharded_model(self) -> None:
-        self.model = wrap(xFormer.from_config(self.config), mixed_precision=True)
-
-        # decoder head
-        self.ln_f = FusedLayerNorm(self.hparams.n_embd)
-        self.head = FusedLinear(self.hparams.n_embd, self.hparams.vocab_size, bias=False)
+        self.model = wrap(
+            xFormerGPT(
+                self.config,
+                n_layer=self.hparams.n_layer,
+                n_embd=self.hparams.n_embd,
+                vocab_size=self.hparams.vocab_size,
+            )
+        )
 
         # todo: when using model parallelism, this may be wrong. will need to redo
         # self.apply(self._init_weights)
-
 
     def _init_weights(self, module):
         if isinstance(module, (nn.Linear, nn.Embedding)):
@@ -165,14 +202,7 @@ class GPT(pl.LightningModule):
         return [optimizer], [lr_scheduler]
 
     def forward(self, src):
-        # encode to latent space
-        prediction = self.model(src)
-
-        # translate the predictions into tokens
-        prediction = self.ln_f(prediction)
-        logits = self.head(prediction)
-
-        return logits
+        return self.model(src)
 
     def training_step(self, batch, _):
         src, targets = batch
@@ -202,9 +232,8 @@ class GPT(pl.LightningModule):
             gradient_clip_val: Optional[Union[int, float]] = None,
             gradient_clip_algorithm: Optional[str] = None,
     ):
-        assert gradient_clip_algorithm == 'norm'
+        assert gradient_clip_algorithm in ('norm', None), gradient_clip_algorithm
         self.model.clip_grad_norm_(gradient_clip_val)
-
 
 
 class CharDataset(Dataset):
