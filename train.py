@@ -54,7 +54,7 @@ class GPT(pl.LightningModule):
             "num_rules": self.hparams.n_head,
         }
         if self.hparams.attention == "blocksparse":
-            blocks = block_size // self.hparams.sparse_block_size
+            blocks = self.hparams.block_size // self.hparams.sparse_block_size
             layout = torch.tril(torch.ones([self.hparams.n_head, blocks, blocks], dtype=torch.bool))
             attention_kwargs["layout"] = layout
             attention_kwargs["block_size"] = self.hparams.sparse_block_size
@@ -302,7 +302,7 @@ def main(
         limit_train_batches=50,
         max_epochs=epochs,
         precision=precision,
-        gradient_clip_val=1,  # Use to catch divergent gradients, if experimenting
+        gradient_clip_val=1,
         log_every_n_steps=1,
         accumulate_grad_batches=accumulate_grad_batches,
         enable_checkpointing=False

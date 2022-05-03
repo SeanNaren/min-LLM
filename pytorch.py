@@ -4,6 +4,7 @@ import math
 import os
 import time
 from pprint import pprint
+from typing import Union
 
 import deepspeed
 import fire
@@ -277,6 +278,7 @@ def main(
         sparse_block_size: int = 128,
         stage: int = 3,
         local_rank: int = 0,
+        precision: Union[str, int] = 16,
 ):
     def print_fn(*args):
         if local_rank_zero:
@@ -327,9 +329,6 @@ def main(
 
     config = {
         "gradient_accumulation_steps": accumulate_grad_batches,
-        "fp16": {
-            "enabled": True
-        },
         "train_micro_batch_size_per_gpu": batch_size_per_gpu,
         "zero_allow_untested_optimizer": False,
         "zero_optimization": {
@@ -340,7 +339,9 @@ def main(
             "reduce_scatter": True,
             "allgather_bucket_size": 2e8,
             "reduce_bucket_size": 2e8,
-        }
+        },
+        "bf16": {"enabled": precision == "bf16"},
+        "fp16": {"enabled": precision == 16}
     }
 
     deepspeed_engine, deepspeed_optimizer, _, _ = deepspeed.initialize(
