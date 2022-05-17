@@ -1,3 +1,6 @@
+import logging
+# disable horrible torch nightly warnings
+logging.getLogger().setLevel(logging.ERROR)
 import math
 import os
 from typing import Union, Optional
@@ -7,10 +10,11 @@ import pytorch_lightning as pl
 import torch
 import torch.nn as nn
 from deepspeed.ops.adam import FusedAdam
-from fairscale.nn import wrap
+from fairscale.nn import checkpoint_wrapper
 from pytorch_lightning import Trainer, seed_everything
-from pytorch_lightning.strategies import DDPFullyShardedStrategy
+from pytorch_lightning.strategies import DDPFullyShardedNativeStrategy
 from pytorch_lightning.utilities import rank_zero_info
+from torch.distributed.fsdp.wrap import wrap
 from torch.nn import functional as F
 from torch.utils.data import DataLoader, Dataset, RandomSampler
 from xformers.factory import xFormerEncoderConfig, xFormerEncoderBlock
@@ -36,7 +40,10 @@ class xFormerGPT(torch.nn.Module):
                 config.layer_position.mark_not_first()
             if i < config.num_layers - 1:
                 config.layer_position.mark_not_last()
-            block = wrap(xFormerEncoderBlock.from_config(config))
+            block = xFormerEncoderBlock.from_config(config)
+            if i > 0:
+                block = checkpoint_wrapper(block)
+            block = wrap(block)
             blocks.append(block)
 
         self.encoders = torch.nn.ModuleList(blocks)
@@ -113,7 +120,7 @@ class GPT(pl.LightningModule):
                 "attention": attention_kwargs
             },
             "feedforward_config": {
-                "name": "FusedMLP",
+                "name": "MLP",
                 "dropout": self.hparams.mlp_pdrop,
                 "activation": "gelu",
                 "hidden_layer_multiplier": self.hparams.hidden_layer_multiplier,
@@ -316,9 +323,10 @@ def main(
     trainer = Trainer(
         accelerator='gpu',
         devices=devices,
-        strategy=DDPFullyShardedStrategy(),
+        strategy=DDPFullyShardedNativeStrategy(),
         callbacks=[
             GPTFLOPsEstimate(
+                profile_start_step=50,
                 global_batch_size=global_batch_size,
                 hidden_size=n_embd,
                 n_layer=n_layer,
@@ -328,7 +336,7 @@ def main(
             ),
             CUDAMemoryCallback(),
         ],
-        limit_train_batches=50,
+        limit_train_batches=100,
         max_epochs=epochs,
         precision=precision,
         gradient_clip_val=1,
