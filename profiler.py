@@ -3,7 +3,7 @@ from typing import Any
 
 import pytorch_lightning as pl
 from pytorch_lightning import Callback
-from pytorch_lightning.utilities import rank_zero_info
+from pytorch_lightning.utilities.rank_zero import rank_zero_info
 
 
 class GPTFLOPsEstimate(Callback):
@@ -35,7 +35,7 @@ class GPTFLOPsEstimate(Callback):
         v = vocab_size
 
         self.num_parameters = (l * (12 * h ** 2 + 13 * h) + v * h + self.s * h + 2 * h) / 10 ** 9
-        print(f"Number of parameters: {self.num_parameters:.2f} Billion")
+        rank_zero_info(f"Number of parameters: {self.num_parameters:.2f} Billion")
 
     def on_train_batch_start(
             self,

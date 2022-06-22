@@ -10,15 +10,15 @@ import pytorch_lightning as pl
 import torch
 import torch.nn as nn
 from deepspeed.ops.adam import FusedAdam
-from fairscale.nn import checkpoint_wrapper
 from pytorch_lightning import Trainer, seed_everything
 from pytorch_lightning.strategies import DDPFullyShardedNativeStrategy
-from pytorch_lightning.utilities import rank_zero_info
+from pytorch_lightning.utilities.rank_zero import rank_zero_info
+from torch.distributed.algorithms._checkpoint.checkpoint_wrapper import CheckpointWrapper
 from torch.distributed.fsdp.wrap import wrap
 from torch.nn import functional as F
 from torch.utils.data import DataLoader, Dataset, RandomSampler
 from xformers.factory import xFormerEncoderConfig, xFormerEncoderBlock
-from xformers.triton import FusedLayerNorm, FusedLinear
+from xformers.triton import FusedLinear
 
 from memory import CUDAMemoryCallback
 from profiler import GPTFLOPsEstimate
@@ -29,7 +29,8 @@ class xFormerGPT(torch.nn.Module):
                  config: xFormerEncoderConfig,
                  n_embd: int,
                  vocab_size: int,
-                 n_layer: int):
+                 n_layer: int,
+                 device: torch.device):
         super().__init__()
 
         blocks = []
@@ -42,14 +43,14 @@ class xFormerGPT(torch.nn.Module):
                 config.layer_position.mark_not_last()
             block = xFormerEncoderBlock.from_config(config)
             if i > 0:
-                block = checkpoint_wrapper(block)
-            block = wrap(block)
+                block = CheckpointWrapper(block)
+            block = wrap(block, device_id=device)
             blocks.append(block)
 
         self.encoders = torch.nn.ModuleList(blocks)
 
         # decoder head
-        self.ln_f = FusedLayerNorm(n_embd)
+        self.ln_f = torch.nn.LayerNorm(n_embd)
         self.head = FusedLinear(n_embd, vocab_size, bias=False)
 
     def forward(self, src):
@@ -127,21 +128,23 @@ class GPT(pl.LightningModule):
             },
         }
 
-        self.config = xFormerEncoderConfig(**config)
+        self.config = xFormerEncoderConfig(**config, use_triton=False)
 
         self.block_size = self.hparams.block_size
 
         self._tokens_seen = 0
 
     def configure_sharded_model(self) -> None:
-        self.model = wrap(
-            xFormerGPT(
+        model = xFormerGPT(
                 self.config,
                 n_layer=self.hparams.n_layer,
                 n_embd=self.hparams.n_embd,
                 vocab_size=self.hparams.vocab_size,
+                device=self.trainer.strategy.root_device
             )
-        )
+
+        self.model = wrap(model, device_id=self.trainer.strategy.root_device)
+        rank_zero_info(self.model)
 
         # todo: when using model parallelism, this may be wrong. will need to redo
         # self.apply(self._init_weights)
@@ -284,7 +287,7 @@ def main(
         block_size: int = 2048,
         warmup: int = 20,
         devices: int = 1,
-        precision: Union[str, int] = 16,
+        precision: Union[str, int] = "bf16",
         n_layer: int = 14,
         n_head: int = 16,
         n_embd: int = 2048,

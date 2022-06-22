@@ -1,15 +1,10 @@
 import psutil
 import torch
 from pytorch_lightning import Callback
-from pytorch_lightning.utilities import rank_zero_info
+from pytorch_lightning.utilities.rank_zero import rank_zero_info
 
 
 class CUDAMemoryCallback(Callback):
-
-    def on_train_epoch_start(self, trainer, pl_module):
-        # Reset the memory use counter
-        torch.cuda.reset_peak_memory_stats(self.root_gpu(trainer))
-        torch.cuda.synchronize(self.root_gpu(trainer))
 
     def root_gpu(self, trainer):
         return trainer.strategy.root_device.index
