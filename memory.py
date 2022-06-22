@@ -1,15 +1,10 @@
 import psutil
 import torch
 from pytorch_lightning import Callback
-from pytorch_lightning.utilities import rank_zero_info
+from pytorch_lightning.utilities.rank_zero import rank_zero_info
 
 
 class CUDAMemoryCallback(Callback):
-
-    def on_train_epoch_start(self, trainer, pl_module):
-        # Reset the memory use counter
-        torch.cuda.reset_peak_memory_stats(self.root_gpu(trainer))
-        torch.cuda.synchronize(self.root_gpu(trainer))
 
     def root_gpu(self, trainer):
         return trainer.strategy.root_device.index
@@ -22,9 +17,9 @@ class CUDAMemoryCallback(Callback):
         swap = psutil.swap_memory()
         swap = round((swap.used / (1024 ** 3)), 2)
 
-        max_memory = trainer.training_type_plugin.reduce(max_memory)
-        virt_mem = trainer.training_type_plugin.reduce(virt_mem)
-        swap = trainer.training_type_plugin.reduce(swap)
+        max_memory = trainer.strategy.reduce(max_memory)
+        virt_mem = trainer.strategy.reduce(virt_mem)
+        swap = trainer.strategy.reduce(swap)
 
         rank_zero_info(f"Average Peak CUDA memory {max_memory:.2f} MiB")
         rank_zero_info(f"Average Peak Virtual memory {virt_mem:.2f} GiB")

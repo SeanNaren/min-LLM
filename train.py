@@ -1,6 +1,9 @@
+import logging
+# disable horrible torch nightly warnings
+logging.getLogger().setLevel(logging.ERROR)
 import math
 import os
-from typing import Union
+from typing import Union, Optional
 
 import fire
 import pytorch_lightning as pl
@@ -8,15 +11,60 @@ import torch
 import torch.nn as nn
 from deepspeed.ops.adam import FusedAdam
 from pytorch_lightning import Trainer, seed_everything
-from pytorch_lightning.strategies import DeepSpeedStrategy
-from pytorch_lightning.utilities import rank_zero_info
+from pytorch_lightning.strategies import DDPFullyShardedNativeStrategy
+from pytorch_lightning.utilities.rank_zero import rank_zero_info
+from torch.distributed.algorithms._checkpoint.checkpoint_wrapper import CheckpointWrapper
+from torch.distributed.fsdp.wrap import wrap
 from torch.nn import functional as F
 from torch.utils.data import DataLoader, Dataset, RandomSampler
 from xformers.factory import xFormerEncoderConfig, xFormerEncoderBlock
-from xformers.triton import FusedLayerNorm, FusedLinear
+from xformers.triton import FusedLinear
 
 from memory import CUDAMemoryCallback
 from profiler import GPTFLOPsEstimate
+
+
+class xFormerGPT(torch.nn.Module):
+    def __init__(self,
+                 config: xFormerEncoderConfig,
+                 n_embd: int,
+                 vocab_size: int,
+                 n_layer: int,
+                 device: torch.device):
+        super().__init__()
+
+        blocks = []
+        for i in range(n_layer):
+            # Label where this layer is in the stack
+            # (for instance useful for the positional encoding, or late layer norm)
+            if i > 0:
+                config.layer_position.mark_not_first()
+            if i < config.num_layers - 1:
+                config.layer_position.mark_not_last()
+            block = xFormerEncoderBlock.from_config(config)
+            if i > 0:
+                block = CheckpointWrapper(block)
+            block = wrap(block, device_id=device)
+            blocks.append(block)
+
+        self.encoders = torch.nn.ModuleList(blocks)
+
+        # decoder head
+        self.ln_f = torch.nn.LayerNorm(n_embd)
+        self.head = FusedLinear(n_embd, vocab_size, bias=False)
+
+    def forward(self, src):
+        # encode to latent space
+        encoders = self.encoders
+        prediction = src.clone()
+        for encoder in encoders:
+            prediction = encoder(prediction)
+
+        # translate the predictions into tokens
+        prediction = self.ln_f(prediction)
+        logits = self.head(prediction)
+
+        return logits
 
 
 class GPT(pl.LightningModule):
@@ -73,39 +121,33 @@ class GPT(pl.LightningModule):
                 "attention": attention_kwargs
             },
             "feedforward_config": {
-                "name": "FusedMLP",
+                "name": "MLP",
                 "dropout": self.hparams.mlp_pdrop,
                 "activation": "gelu",
                 "hidden_layer_multiplier": self.hparams.hidden_layer_multiplier,
             },
         }
 
-        self.config = xFormerEncoderConfig(**config)
+        self.config = xFormerEncoderConfig(**config, use_triton=False)
 
         self.block_size = self.hparams.block_size
 
         self._tokens_seen = 0
 
     def configure_sharded_model(self) -> None:
-        blocks = []
-        for i in range(self.hparams.n_layer):
-            # Label where this layer is in the stack
-            # (for instance useful for the positional encoding, or late layer norm)
-            if i > 0:
-                self.config.layer_position.mark_not_first()
-            if i < self.config.num_layers - 1:
-                self.config.layer_position.mark_not_last()
-            blocks.append(xFormerEncoderBlock.from_config(self.config))
+        model = xFormerGPT(
+                self.config,
+                n_layer=self.hparams.n_layer,
+                n_embd=self.hparams.n_embd,
+                vocab_size=self.hparams.vocab_size,
+                device=self.trainer.strategy.root_device
+            )
 
-        self.encoders = torch.nn.ModuleList(blocks)
-
-        # decoder head
-        self.ln_f = FusedLayerNorm(self.hparams.n_embd)
-        self.head = FusedLinear(self.hparams.n_embd, self.hparams.vocab_size, bias=False)
+        self.model = wrap(model, device_id=self.trainer.strategy.root_device)
+        rank_zero_info(self.model)
 
         # todo: when using model parallelism, this may be wrong. will need to redo
-        self.apply(self._init_weights)
-
+        # self.apply(self._init_weights)
 
     def _init_weights(self, module):
         if isinstance(module, (nn.Linear, nn.Embedding)):
@@ -170,18 +212,7 @@ class GPT(pl.LightningModule):
         return [optimizer], [lr_scheduler]
 
     def forward(self, src):
-        # encode to latent space
-        encoders = self.encoders
-        prediction = src.clone()
-        for encoder in encoders:
-            # prediction = deepspeed.checkpointing.checkpoint(encoder, prediction)
-            prediction = encoder(prediction)
-
-        # translate the predictions into tokens
-        prediction = self.ln_f(prediction)
-        logits = self.head(prediction)
-
-        return logits
+        return self.model(src)
 
     def training_step(self, batch, _):
         src, targets = batch
@@ -203,6 +234,16 @@ class GPT(pl.LightningModule):
         )
 
         return loss
+
+    def configure_gradient_clipping(
+            self,
+            optimizer,
+            optimizer_idx: int,
+            gradient_clip_val: Optional[Union[int, float]] = None,
+            gradient_clip_algorithm: Optional[str] = None,
+    ):
+        assert gradient_clip_algorithm in ('norm', None), gradient_clip_algorithm
+        self.model.clip_grad_norm_(gradient_clip_val)
 
 
 class CharDataset(Dataset):
@@ -246,14 +287,12 @@ def main(
         block_size: int = 2048,
         warmup: int = 20,
         devices: int = 1,
-        precision: Union[str, int] = 16,
+        precision: Union[str, int] = "bf16",
         n_layer: int = 14,
         n_head: int = 16,
         n_embd: int = 2048,
         attention: str = "scaled_dot_product",
         sparse_block_size: int = 128,
-        strategy: str = "deepspeed",
-        stage: int = 3
 ):
     seed_everything(42)
 
@@ -265,19 +304,6 @@ def main(
     text = open("input.txt", "r").read()
     train_dataset = CharDataset(text, block_size)
     global_batch_size = batch_size_per_gpu * devices
-    config = {
-        "zero_allow_untested_optimizer": True,
-        "zero_optimization": {
-            "stage": stage,
-            "contiguous_gradients": True,
-            "overlap_comm": True,
-            "allgather_partitions": True,
-            "reduce_scatter": True,
-        },
-        "train_micro_batch_size_per_gpu": batch_size_per_gpu,
-        "bf16": {"enabled": precision == "bf16"},
-        "fp16": {"enabled": precision == 16}
-    }
 
     train_loader = DataLoader(
         train_dataset,
@@ -300,9 +326,10 @@ def main(
     trainer = Trainer(
         accelerator='gpu',
         devices=devices,
-        strategy=DeepSpeedStrategy(config=config) if strategy == 'deepspeed' else strategy,
+        strategy=DDPFullyShardedNativeStrategy(),
         callbacks=[
             GPTFLOPsEstimate(
+                profile_start_step=50,
                 global_batch_size=global_batch_size,
                 hidden_size=n_embd,
                 n_layer=n_layer,
@@ -312,7 +339,7 @@ def main(
             ),
             CUDAMemoryCallback(),
         ],
-        limit_train_batches=50,
+        limit_train_batches=100,
         max_epochs=epochs,
         precision=precision,
         gradient_clip_val=1,

@@ -3,7 +3,7 @@ from typing import Any
 
 import pytorch_lightning as pl
 from pytorch_lightning import Callback
-from pytorch_lightning.utilities import rank_zero_info
+from pytorch_lightning.utilities.rank_zero import rank_zero_info
 
 
 class GPTFLOPsEstimate(Callback):
@@ -35,7 +35,7 @@ class GPTFLOPsEstimate(Callback):
         v = vocab_size
 
         self.num_parameters = (l * (12 * h ** 2 + 13 * h) + v * h + self.s * h + 2 * h) / 10 ** 9
-        print(f"Number of parameters: {self.num_parameters:.2f} Billion")
+        rank_zero_info(f"Number of parameters: {self.num_parameters:.2f} Billion")
 
     def on_train_batch_start(
             self,
@@ -66,7 +66,7 @@ class GPTFLOPsEstimate(Callback):
             factor = 4 if self.activation_checkpointing else 3
             num_steps = self.profile_num_steps
             per_iteration_time = total_time / num_steps
-            gpus = trainer.devices
+            gpus = trainer.num_devices
             flops = self.num_parameters * factor * 2 * self.s * self.global_batch_size
             flops = flops / (per_iteration_time * gpus * 1e3)
             rank_zero_info(f"Estimates: {flops:.2f}TFLOPs Avg Iteration Time: {per_iteration_time:.2f}s")
