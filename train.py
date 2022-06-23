@@ -2,6 +2,7 @@ import math
 import os
 from typing import Union
 
+import deepspeed
 import fire
 import pytorch_lightning as pl
 import torch
@@ -13,7 +14,7 @@ from pytorch_lightning.utilities import rank_zero_info
 from torch.nn import functional as F
 from torch.utils.data import DataLoader, Dataset, RandomSampler
 from xformers.factory import xFormerEncoderConfig, xFormerEncoderBlock
-from xformers.triton import FusedLayerNorm, FusedLinear
+from xformers.triton import FusedLinear
 
 from memory import CUDAMemoryCallback
 from profiler import GPTFLOPsEstimate
@@ -59,6 +60,7 @@ class GPT(pl.LightningModule):
             attention_kwargs["block_size"] = self.hparams.sparse_block_size
 
         config = {
+            "use_triton": False,
             "dim_model": self.hparams.n_embd,
             "layer_norm_style": "pre",
             "position_encoding_config": {
@@ -73,7 +75,7 @@ class GPT(pl.LightningModule):
                 "attention": attention_kwargs
             },
             "feedforward_config": {
-                "name": "FusedMLP",
+                "name": "MLP",
                 "dropout": self.hparams.mlp_pdrop,
                 "activation": "gelu",
                 "hidden_layer_multiplier": self.hparams.hidden_layer_multiplier,
@@ -100,12 +102,11 @@ class GPT(pl.LightningModule):
         self.encoders = torch.nn.ModuleList(blocks)
 
         # decoder head
-        self.ln_f = FusedLayerNorm(self.hparams.n_embd)
+        self.ln_f = torch.nn.LayerNorm(self.hparams.n_embd)
         self.head = FusedLinear(self.hparams.n_embd, self.hparams.vocab_size, bias=False)
 
         # todo: when using model parallelism, this may be wrong. will need to redo
         self.apply(self._init_weights)
-
 
     def _init_weights(self, module):
         if isinstance(module, (nn.Linear, nn.Embedding)):
@@ -173,9 +174,12 @@ class GPT(pl.LightningModule):
         # encode to latent space
         encoders = self.encoders
         prediction = src.clone()
-        for encoder in encoders:
-            # prediction = deepspeed.checkpointing.checkpoint(encoder, prediction)
-            prediction = encoder(prediction)
+        for x, encoder in enumerate(encoders):
+            if x == 0:
+                # todo: checkpointing the first batch causes some error
+                prediction = encoder(prediction)
+            else:
+                prediction = deepspeed.checkpointing.checkpoint(encoder, prediction)
 
         # translate the predictions into tokens
         prediction = self.ln_f(prediction)
@@ -308,7 +312,7 @@ def main(
                 n_layer=n_layer,
                 block_size=block_size,
                 vocab_size=train_dataset.vocab_size,
-                activation_checkpointing=False
+                activation_checkpointing=True
             ),
             CUDAMemoryCallback(),
         ],
