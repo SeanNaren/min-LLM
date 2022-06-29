@@ -1,3 +1,4 @@
+import logging
 import math
 import os
 from typing import Union
@@ -277,6 +278,9 @@ def main(
             "overlap_comm": True,
             "allgather_partitions": True,
             "reduce_scatter": True,
+            "reduce_bucket_size": n_embd * n_embd,
+            "stage3_prefetch_bucket_size": 0.9 * n_embd * n_embd,
+            "stage3_param_persistence_threshold": 10 * n_embd
         },
         "train_micro_batch_size_per_gpu": batch_size_per_gpu,
         "bf16": {"enabled": precision == "bf16"},
@@ -304,7 +308,7 @@ def main(
     trainer = Trainer(
         accelerator='gpu',
         devices=devices,
-        strategy=DeepSpeedStrategy(config=config) if strategy == 'deepspeed' else strategy,
+        strategy=DeepSpeedStrategy(config=config, logging_level=logging.INFO) if strategy == 'deepspeed' else strategy,
         callbacks=[
             GPTFLOPsEstimate(
                 global_batch_size=global_batch_size,
