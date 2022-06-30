@@ -15,7 +15,7 @@ from pytorch_lightning import seed_everything
 from torch.nn import functional as F
 from torch.utils.data import DataLoader, Dataset, DistributedSampler
 from xformers.factory import xFormerEncoderConfig, xFormerEncoderBlock
-from xformers.triton import FusedLayerNorm, FusedLinear
+from xformers.triton import FusedLinear
 
 
 class GPT(torch.nn.Module):
@@ -72,6 +72,8 @@ class GPT(torch.nn.Module):
             attention_kwargs["block_size"] = self.sparse_block_size
 
         config = {
+            # disabled due to bfloat16 support missing for layernorm & softmax
+            "use_triton": False,
             "dim_model": self.n_embd,
             "layer_norm_style": "pre",
             "position_encoding_config": {
@@ -86,7 +88,7 @@ class GPT(torch.nn.Module):
                 "attention": attention_kwargs
             },
             "feedforward_config": {
-                "name": "FusedMLP",
+                "name": "MLP",
                 "dropout": self.mlp_pdrop,
                 "activation": "gelu",
                 "hidden_layer_multiplier": self.hidden_layer_multiplier,
@@ -112,12 +114,11 @@ class GPT(torch.nn.Module):
         self.encoders = torch.nn.ModuleList(blocks)
 
         # decoder head
-        self.ln_f = FusedLayerNorm(self.n_embd)
+        self.ln_f = torch.nn.LayerNorm(self.n_embd)
         self.head = FusedLinear(self.n_embd, self.vocab_size, bias=False)
 
         # todo: when using model parallelism, this may be wrong. will need to redo
         self.apply(self._init_weights)
-
 
     def _init_weights(self, module):
         if isinstance(module, (nn.Linear, nn.Embedding)):
@@ -178,8 +179,8 @@ class GPT(torch.nn.Module):
         encoders = self.encoders
         prediction = src.clone()
         for encoder in encoders:
-            # prediction = deepspeed.checkpointing.checkpoint(encoder, prediction)
-            prediction = encoder(prediction)
+            prediction = deepspeed.checkpointing.checkpoint(encoder, prediction)
+            # prediction = encoder(prediction)
 
         # translate the predictions into tokens
         prediction = self.ln_f(prediction)
@@ -234,28 +235,35 @@ class Profiler:
         self.activation_checkpointing = activation_checkpointing
         self.num_devices = num_devices
         self.device = device
-        h = hidden_size
-        l = n_layer
         self.s = block_size
-        v = vocab_size
+        self.h = hidden_size
+        self.l = n_layer
+        self.v = vocab_size
 
-        self.num_parameters = (l * (12 * h ** 2 + 13 * h) + v * h + self.s * h + 2 * h) / 10 ** 9
+        self.num_parameters = (self.l * (
+                12 * self.h ** 2 + 13 * self.h) + self.v * self.h + self.s * self.h + 2 * self.h) / 10 ** 9
         print(f"Number of parameters: {self.num_parameters:.2f} Billion")
 
         torch.cuda.reset_peak_memory_stats(self.device)
         torch.cuda.synchronize(self.device)
 
     def start_profiling(self):
+        torch.cuda.synchronize(self.device)
         self.start = time.time()
 
     def end_profiling(self, num_steps) -> None:
+        torch.cuda.synchronize(self.device)
         total_time = time.time() - self.start
         factor = 4 if self.activation_checkpointing else 3
         per_iteration_time = total_time / num_steps
-        flops = self.num_parameters * factor * 2 * self.s * self.global_batch_size
-        flops = flops / (per_iteration_time * self.num_devices * 1e3)
-        print(f"Estimates: {flops:.2f}TFLOPs Avg Iteration Time: {per_iteration_time:.2f}s")
-
+        # General TFLOPs formula (borrowed from Equation 3 in Section 5.1 of
+        # https://arxiv.org/pdf/2104.04473.pdf).
+        # https://github.com/bigscience-workshop/Megatron-DeepSpeed/pull/251/files
+        flops_per_iteration = (24 * factor * self.global_batch_size * self.s * self.l * (
+                    self.h ** 2)) * (1. + (self.s / (6. * self.h)) + (
+                    self.v / (16. * self.l * self.h)))
+        tflops = flops_per_iteration / (per_iteration_time * self.num_devices * (10 ** 12))
+        print(f"Estimates: {tflops:.2f}TFLOPs Avg Iteration Time: {per_iteration_time:.2f}s")
         torch.cuda.synchronize(self.device)
         max_memory = torch.cuda.max_memory_allocated(self.device) / 2 ** 20
         print(f"Average Peak CUDA memory {max_memory:.2f} MiB")
@@ -269,8 +277,8 @@ def main(
         block_size: int = 2048,
         warmup: int = 20,
         profile_start_step: int = 20,
-        profile_num_steps: int = 20,
-        logging_level: int = logging.WARN,
+        profile_num_steps: int = 5,
+        logging_level: int = logging.INFO,
         n_layer: int = 14,
         n_head: int = 16,
         n_embd: int = 2048,
@@ -328,18 +336,19 @@ def main(
     model_parameters = filter(lambda p: p.requires_grad, model.parameters())
 
     config = {
-        "gradient_accumulation_steps": accumulate_grad_batches,
-        "train_micro_batch_size_per_gpu": batch_size_per_gpu,
-        "zero_allow_untested_optimizer": False,
+        "zero_allow_untested_optimizer": True,
         "zero_optimization": {
             "stage": stage,
             "contiguous_gradients": True,
             "overlap_comm": True,
             "allgather_partitions": True,
             "reduce_scatter": True,
-            "allgather_bucket_size": 2e8,
-            "reduce_bucket_size": 2e8,
+            "reduce_bucket_size": n_embd * n_embd,
+            "stage3_prefetch_bucket_size": 0.9 * n_embd * n_embd,
+            "stage3_param_persistence_threshold": 10 * n_embd,
         },
+        "gradient_clipping": 1,
+        "train_micro_batch_size_per_gpu": batch_size_per_gpu,
         "bf16": {"enabled": precision == "bf16"},
         "fp16": {"enabled": precision == 16}
     }
@@ -360,7 +369,7 @@ def main(
             n_layer=n_layer,
             block_size=block_size,
             vocab_size=train_dataset.vocab_size,
-            activation_checkpointing=False,
+            activation_checkpointing=True,
             num_devices=num_devices,
             device=root_device,
         )
