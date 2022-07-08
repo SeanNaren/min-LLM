@@ -18,6 +18,22 @@ from xformers.factory import xFormerEncoderConfig, xFormerEncoderBlock
 from xformers.triton import FusedLinear
 
 
+class ModuleWrapperIgnores2ndArg(nn.Module):
+    """
+    Taken from https://discuss.pytorch.org/t/checkpoint-with-no-grad-requiring-inputs-problem/19117/11.
+    When using activation checkpointing, we have to ensure that there exists an input that requires gradients,
+    otherwise this breaks the autograd tape.
+    """
+    def __init__(self, module):
+        super().__init__()
+        self.module = module
+
+    def forward(self,x, dummy_arg=None):
+        assert dummy_arg is not None
+        x = self.module(x)
+        return x
+
+
 class GPT(torch.nn.Module):
 
     def __init__(
@@ -38,7 +54,6 @@ class GPT(torch.nn.Module):
             warmup_tokens=20,
             final_tokens=1000,
             sparse_block_size=128,
-            local_rank=0,
     ):
         super().__init__()
         self.vocab_size = vocab_size
@@ -98,6 +113,7 @@ class GPT(torch.nn.Module):
         self.config = xFormerEncoderConfig(**config)
 
         self.block_size = self.block_size
+        self.dummy_tensor = torch.ones(1, dtype=torch.float32, requires_grad=True)
 
         self._tokens_seen = 0
 
@@ -109,7 +125,7 @@ class GPT(torch.nn.Module):
                 self.config.layer_position.mark_not_first()
             if i < self.config.num_layers - 1:
                 self.config.layer_position.mark_not_last()
-            blocks.append(xFormerEncoderBlock.from_config(self.config))
+            blocks.append(ModuleWrapperIgnores2ndArg(xFormerEncoderBlock.from_config(self.config)))
 
         self.encoders = torch.nn.ModuleList(blocks)
 
@@ -117,7 +133,7 @@ class GPT(torch.nn.Module):
         self.ln_f = torch.nn.LayerNorm(self.n_embd)
         self.head = FusedLinear(self.n_embd, self.vocab_size, bias=False)
 
-        # todo: when using model parallelism, this may be wrong. will need to redo
+        # todo: when using model parallelism, this will be wrong. will need to redo
         self.apply(self._init_weights)
 
     def _init_weights(self, module):
@@ -174,16 +190,13 @@ class GPT(torch.nn.Module):
         return optimizer, lr_scheduler
 
     def forward(self, batch):
-        src, targets = batch
+        x, targets = batch
         # encode to latent space
-        encoders = self.encoders
-        prediction = src.clone()
-        for encoder in encoders:
-            prediction = deepspeed.checkpointing.checkpoint(encoder, prediction)
-            # prediction = encoder(prediction)
+        for encoder in self.encoders:
+            x = deepspeed.checkpointing.checkpoint(encoder, x, self.dummy_tensor)
 
         # translate the predictions into tokens
-        prediction = self.ln_f(prediction)
+        prediction = self.ln_f(x)
         logits = self.head(prediction)
 
         return F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1))
@@ -270,18 +283,18 @@ class Profiler:
 
 
 def main(
-        batch_size_per_gpu: int = 2,
+        batch_size_per_gpu: int = 36,
         accumulate_grad_batches: int = 1,
         num_workers: int = 4,
         epochs: int = 1,
         block_size: int = 2048,
         warmup: int = 20,
         profile_start_step: int = 20,
-        profile_num_steps: int = 5,
+        profile_num_steps: int = 20,
         logging_level: int = logging.INFO,
-        n_layer: int = 14,
-        n_head: int = 16,
-        n_embd: int = 2048,
+        n_layer: int = 24,
+        n_head: int = 24,
+        n_embd: int = 2304,
         attention: str = "scaled_dot_product",
         sparse_block_size: int = 128,
         stage: int = 3,

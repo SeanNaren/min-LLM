@@ -21,6 +21,22 @@ from memory import CUDAMemoryCallback
 from profiler import GPTFLOPsEstimate
 
 
+class ModuleWrapperIgnores2ndArg(nn.Module):
+    """
+    Taken from https://discuss.pytorch.org/t/checkpoint-with-no-grad-requiring-inputs-problem/19117/11.
+    When using activation checkpointing, we have to ensure that there exists an input that requires gradients,
+    otherwise this breaks the autograd tape.
+    """
+    def __init__(self, module):
+        super().__init__()
+        self.module = module
+
+    def forward(self,x, dummy_arg=None):
+        assert dummy_arg is not None
+        x = self.module(x)
+        return x
+
+
 class GPT(pl.LightningModule):
 
     def __init__(
@@ -61,6 +77,7 @@ class GPT(pl.LightningModule):
             attention_kwargs["block_size"] = self.hparams.sparse_block_size
 
         config = {
+            # disabled due to bfloat16 support missing for layernorm & softmax
             "use_triton": False,
             "dim_model": self.hparams.n_embd,
             "layer_norm_style": "pre",
@@ -86,6 +103,7 @@ class GPT(pl.LightningModule):
         self.config = xFormerEncoderConfig(**config)
 
         self.block_size = self.hparams.block_size
+        self.dummy_tensor = torch.ones(1, dtype=torch.float32, requires_grad=True)
 
         self._tokens_seen = 0
 
@@ -98,7 +116,7 @@ class GPT(pl.LightningModule):
                 self.config.layer_position.mark_not_first()
             if i < self.config.num_layers - 1:
                 self.config.layer_position.mark_not_last()
-            blocks.append(xFormerEncoderBlock.from_config(self.config))
+            blocks.append(ModuleWrapperIgnores2ndArg(xFormerEncoderBlock.from_config(self.config)))
 
         self.encoders = torch.nn.ModuleList(blocks)
 
@@ -171,19 +189,13 @@ class GPT(pl.LightningModule):
         }
         return [optimizer], [lr_scheduler]
 
-    def forward(self, src):
+    def forward(self, x):
         # encode to latent space
-        encoders = self.encoders
-        prediction = src.clone()
-        for x, encoder in enumerate(encoders):
-            if x == 0:
-                # todo: checkpointing the first batch causes some error
-                prediction = encoder(prediction)
-            else:
-                prediction = deepspeed.checkpointing.checkpoint(encoder, prediction)
+        for encoder in self.encoders:
+            x = deepspeed.checkpointing.checkpoint(encoder, x, self.dummy_tensor)
 
         # translate the predictions into tokens
-        prediction = self.ln_f(prediction)
+        prediction = self.ln_f(x)
         logits = self.head(prediction)
 
         return logits
@@ -244,7 +256,7 @@ class CharDataset(Dataset):
 
 
 def main(
-        batch_size_per_gpu: int = 2,
+        batch_size_per_gpu: int = 36,
         accumulate_grad_batches: int = 1,
         num_workers: int = 4,
         epochs: int = 1,
@@ -252,9 +264,9 @@ def main(
         warmup: int = 20,
         devices: int = 1,
         precision: Union[str, int] = 16,
-        n_layer: int = 14,
-        n_head: int = 16,
-        n_embd: int = 2048,
+        n_layer: int = 24,
+        n_head: int = 24,
+        n_embd: int = 2304,
         attention: str = "scaled_dot_product",
         sparse_block_size: int = 128,
         strategy: str = "deepspeed",
