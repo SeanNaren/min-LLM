@@ -30,7 +30,7 @@ pip install -r requirements.txt
 
 ## Train
 
-To train a 1.5B parameter model (based on the megatron paper sizes) on 8 GPUs:
+To train a 1.5B parameter model based on the Megatron architecture sizes using 8 GPUs (model will not fit on 1 GPU with optimal throughput, we scale to multiple).
 
 ```
 deepspeed --num_gpus 8 train.py --batch_size_per_gpu 36
@@ -40,4 +40,13 @@ deepspeed --num_gpus 8 train.py --batch_size_per_gpu 36
 
 Code: 
 
-Papers + notes:
+* [minGPT](https://github.com/karpathy/minGPT) - A lot of the base code was borrowed and extended from this awesome library
+* [microGPT](https://github.com/facebookresearch/xformers/blob/main/examples/microGPT.py) - A helpful example with xFormers
+* [Megatron-DeepSpeed](https://github.com/microsoft/Megatron-DeepSpeed) - Learning the use of Deepspeed with the Megatron architecture/3d parallelism.
+
+Papers:
+
+* [Efficient Large-Scale Language Model Training on GPU Clusters
+Using Megatron-LM](https://cs.stanford.edu/~matei/papers/2021/sc_megatron_lm.pdf)
+* [Training Compute-Optimal Large Language Models](https://arxiv.org/pdf/2203.15556.pdf)
+* [What Language Model to Train if You Have One Million GPU Hours?](https://openreview.net/pdf?id=rI7BL3fHIZq)
