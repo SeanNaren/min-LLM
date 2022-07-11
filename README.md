@@ -1,16 +1,43 @@
-# SmallScience
+# min-LLM
 
-SmallScience (inspired by the amazing [BigScience](https://bigscience.huggingface.co/)) is my humble learning experience to train a large (but not too large) transformer model.
+Minimal code to train a relatively large language model (1-10B parameters).
 
-![chippy](chippy.png)
+* Minimal codebase to learn and adapt for your own use cases
+* Concise demonstration of tricks to optimally train a larger language model
+* Allows exploration of compute optimal models at smaller sizes based on realistic scaling laws
 
-My TLDR goals:
+The project was inspired by [megatron](https://github.com/NVIDIA/Megatron-LM) and all sub-variants. This repo can be seen as a condensed variant, where some of the very large scaling tricks are stripped out for the sake of readability/simplicity.
 
-* Explore determining the optimal model and dataset for my (currently) non-existent compute, and how to make training as efficient as possible 
-* To learn what techniques/tricks in practice make [BigScience](https://bigscience.huggingface.co/), [GPT-NeoX](https://github.com/EleutherAI/gpt-neox) or Large transformer model training possible. I've learnt a lot about the theory, but I want to put it into practice!
-* Code in a way that is comfortable for extension/modifiability. This means relying on open source as much as possible, using libraries to handle the boilerplate.
-* Hopefully train a large(ish) model and provide a useful codebase :)
+For example, the library does not include Tensor Parallelism/Pipeline Parallelism. If you need to reach those 100B+ parameter models, I suggest looking at [megatron](https://github.com/NVIDIA/Megatron-LM).
 
-I would love this to be a joint effort with people from the community, so more than happy to collaborate with others!
+## Setup
 
-All my progress/mistakes/thoughts current can be found in the [issues](https://github.com/SeanNaren/SmallScience/issues).
+Make sure you're installing/running on a CUDA supported machine.
+
+To improve performance, we use a few fused kernel layers from Apex (if you're unsure what fused kernels are for, I highly suggest [this](https://horace.io/brrr_intro.html) blogpost).
+
+```
+git clone https://github.com/NVIDIA/apex
+cd apex
+pip install -v --disable-pip-version-check --no-cache-dir --global-option="--cpp_ext" --global-option="--cuda_ext" ./
+```
+
+Install the rest of the requirements:
+
+```
+pip install -r requirements.txt
+```
+
+## Train
+
+To train a 1.5B parameter model (based on the megatron paper sizes) on 8 GPUs:
+
+```
+deepspeed --num_gpus 8 train.py --batch_size_per_gpu 36
+```
+
+## References
+
+Code: 
+
+Papers + notes:

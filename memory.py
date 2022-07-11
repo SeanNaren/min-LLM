@@ -5,7 +5,6 @@ from pytorch_lightning.utilities.rank_zero import rank_zero_info
 
 
 class CUDAMemoryCallback(Callback):
-
     def on_train_epoch_start(self, trainer, pl_module):
         # Reset the memory use counter
         torch.cuda.reset_peak_memory_stats(self.root_gpu(trainer))
