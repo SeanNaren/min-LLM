@@ -1,215 +1,24 @@
-import math
+import argparse
+import logging
 import os
+import random
+import time
+from pprint import pprint
 from typing import Union
 
+import deepspeed
 import fire
-import pytorch_lightning as pl
+import numpy as np
 import torch
-import torch.nn as nn
-from deepspeed.ops.adam import FusedAdam
-from pytorch_lightning import Trainer, seed_everything
-from pytorch_lightning.strategies import DeepSpeedStrategy
-from pytorch_lightning.utilities import rank_zero_info
-from torch.nn import functional as F
-from torch.utils.data import DataLoader, Dataset, RandomSampler
-from xformers.factory import xFormerEncoderConfig, xFormerEncoderBlock
-from xformers.triton import FusedLayerNorm, FusedLinear
+from torch.utils.data import DataLoader, Dataset, DistributedSampler
 
-from memory import CUDAMemoryCallback
-from profiler import GPTFLOPsEstimate
-
-
-class GPT(pl.LightningModule):
-
-    def __init__(
-            self,
-            vocab_size,
-            weight_decay=0.1,
-            betas=(0.9, 0.95),
-            learning_rate=6e-4,
-            n_embd=512,
-            block_size=128,
-            n_layer=8,
-            n_head=8,
-            resid_pdrop=0.1,
-            attn_pdrop=0.1,
-            mlp_pdrop=0.1,
-            attention="scaled_dot_product",
-            hidden_layer_multiplier=4,
-            warmup_tokens=20,
-            final_tokens=1000,
-            sparse_block_size=128
-    ):
-        super().__init__()
-
-        # auto creates self.hparams from the method signature
-        self.save_hyperparameters()
-
-        attention_kwargs = {
-            "name": self.hparams.attention,
-            "dropout": self.hparams.attn_pdrop,
-            "causal": True,
-            "seq_len": self.hparams.block_size,
-            "num_rules": self.hparams.n_head,
-        }
-        if self.hparams.attention == "blocksparse":
-            blocks = self.hparams.block_size // self.hparams.sparse_block_size
-            layout = torch.tril(torch.ones([self.hparams.n_head, blocks, blocks], dtype=torch.bool))
-            attention_kwargs["layout"] = layout
-            attention_kwargs["block_size"] = self.hparams.sparse_block_size
-
-        config = {
-            "dim_model": self.hparams.n_embd,
-            "layer_norm_style": "pre",
-            "position_encoding_config": {
-                "name": "vocab",
-                "seq_len": self.hparams.block_size,
-                "vocab_size": self.hparams.vocab_size,
-            },
-            "multi_head_config": {
-                "num_heads": self.hparams.n_head,
-                "residual_dropout": self.hparams.resid_pdrop,
-                "use_rotary_embeddings": True,
-                "attention": attention_kwargs
-            },
-            "feedforward_config": {
-                "name": "FusedMLP",
-                "dropout": self.hparams.mlp_pdrop,
-                "activation": "gelu",
-                "hidden_layer_multiplier": self.hparams.hidden_layer_multiplier,
-            },
-        }
-
-        self.config = xFormerEncoderConfig(**config)
-
-        self.block_size = self.hparams.block_size
-
-        self._tokens_seen = 0
-
-    def configure_sharded_model(self) -> None:
-        blocks = []
-        for i in range(self.hparams.n_layer):
-            # Label where this layer is in the stack
-            # (for instance useful for the positional encoding, or late layer norm)
-            if i > 0:
-                self.config.layer_position.mark_not_first()
-            if i < self.config.num_layers - 1:
-                self.config.layer_position.mark_not_last()
-            blocks.append(xFormerEncoderBlock.from_config(self.config))
-
-        self.encoders = torch.nn.ModuleList(blocks)
-
-        # decoder head
-        self.ln_f = FusedLayerNorm(self.hparams.n_embd)
-        self.head = FusedLinear(self.hparams.n_embd, self.hparams.vocab_size, bias=False)
-
-        # todo: when using model parallelism, this may be wrong. will need to redo
-        self.apply(self._init_weights)
-
-
-    def _init_weights(self, module):
-        if isinstance(module, (nn.Linear, nn.Embedding)):
-            module.weight.data.normal_(mean=0.0, std=0.02)
-            if isinstance(module, nn.Linear) and module.bias is not None:
-                module.bias.data.zero_()
-        elif isinstance(module, nn.LayerNorm):
-            module.bias.data.zero_()
-            module.weight.data.fill_(1.0)
-
-        # Reset the token counter
-        self._tokens_seen = 0
-
-    def get_block_size(self):
-        return self.block_size
-
-    def configure_optimizers(self):
-        # Create the optimizer and the training schedule:
-        # - Handle the per-param weight decay
-        no_decay = ["bias", "LayerNorm.weight"]
-        params_decay = [
-            p for n, p in self.named_parameters() if not any(nd in n for nd in no_decay)
-        ]
-        params_nodecay = [
-            p for n, p in self.named_parameters() if any(nd in n for nd in no_decay)
-        ]
-        optim_groups = [
-            {"params": params_decay, "weight_decay": self.hparams.weight_decay},
-            {"params": params_nodecay, "weight_decay": 0.0},
-        ]
-
-        # - Start with a warm up, ramp up then cosine
-        optimizer = FusedAdam(
-            optim_groups, lr=self.hparams.learning_rate, betas=self.hparams.betas
-        )
-
-        def update_lr(*_):
-            config = self.hparams
-
-            if self._tokens_seen < config.warmup_tokens:
-                # linear warmup
-                lr_mult = float(self._tokens_seen) / float(max(1, config.warmup_tokens))
-                lr_mult = max(lr_mult, 1e-2)  # could be that we've not seen any yet
-            else:
-                # cosine learning rate decay
-                progress = float(self._tokens_seen - config.warmup_tokens) / float(
-                    max(1, config.final_tokens - config.warmup_tokens)
-                )
-                lr_mult = max(0.1, 0.5 * (1.0 + math.cos(math.pi * progress)))
-
-            return lr_mult
-
-        lr_scheduler = {
-            "scheduler": torch.optim.lr_scheduler.LambdaLR(
-                optimizer,
-                lr_lambda=[update_lr, update_lr],
-            ),
-            "name": "learning_rate",
-            "interval": "step",  # The unit of the scheduler's step size
-            "frequency": 1,  # The frequency of the scheduler
-        }
-        return [optimizer], [lr_scheduler]
-
-    def forward(self, src):
-        # encode to latent space
-        encoders = self.encoders
-        prediction = src.clone()
-        for encoder in encoders:
-            # prediction = deepspeed.checkpointing.checkpoint(encoder, prediction)
-            prediction = encoder(prediction)
-
-        # translate the predictions into tokens
-        prediction = self.ln_f(prediction)
-        logits = self.head(prediction)
-
-        return logits
-
-    def training_step(self, batch, _):
-        src, targets = batch
-
-        # Update the tokens we've seen (tracked for LR scheduling)
-        self._tokens_seen += (src >= 0).numel()
-
-        # same action as inference
-        logits = self(src)
-
-        loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1))
-
-        self.logger.log_metrics(
-            {
-                "train_loss": loss.mean(),
-                "learning_rate": self.lr_schedulers().get_last_lr()[0],
-            },
-            step=self.trainer.global_step,
-        )
-
-        return loss
+from model import LLM
 
 
 class CharDataset(Dataset):
     def __init__(self, data, block_size):
         chars = list(set(data))
         data_size, vocab_size = len(data), len(chars)
-        rank_zero_info("data has %d characters, %d unique." % (data_size, vocab_size))
 
         self.stoi = {ch: i for i, ch in enumerate(chars)}
         self.itos = {i: ch for i, ch in enumerate(chars)}
@@ -221,7 +30,7 @@ class CharDataset(Dataset):
         return len(self.data) - self.block_size
 
     def __getitem__(self, i):
-        chunk = self.data[i: i + self.block_size + 1]
+        chunk = self.data[i : i + self.block_size + 1]
         dix = [self.stoi[s] for s in chunk]
 
         # src and target are off by one, we want the model to predict the next word
@@ -238,33 +47,130 @@ class CharDataset(Dataset):
         return "".join([self.itos[int(i)] for i in tokens])
 
 
+class Profiler:
+    def __init__(
+        self,
+        global_batch_size: int,
+        hidden_size: int,
+        num_devices: int,
+        device: torch.device,
+        n_layer: int,
+        block_size: int,
+        vocab_size: int,
+        activation_checkpointing: bool = False,
+    ):
+        self.global_batch_size = global_batch_size
+        self.activation_checkpointing = activation_checkpointing
+        self.num_devices = num_devices
+        self.device = device
+        self.s = block_size
+        self.h = hidden_size
+        self.l = n_layer
+        self.v = vocab_size
+
+        self.num_parameters = (
+            self.l * (12 * self.h ** 2 + 13 * self.h)
+            + self.v * self.h
+            + self.s * self.h
+            + 2 * self.h
+        ) / 10 ** 9
+        print(f"Number of parameters: {self.num_parameters:.2f} Billion")
+
+        torch.cuda.reset_peak_memory_stats(self.device)
+        torch.cuda.synchronize(self.device)
+
+    def start_profiling(self):
+        torch.cuda.synchronize(self.device)
+        self.start = time.time()
+
+    def end_profiling(self, num_steps) -> None:
+        torch.cuda.synchronize(self.device)
+        total_time = time.time() - self.start
+        factor = 4 if self.activation_checkpointing else 3
+        per_iteration_time = total_time / num_steps
+        # General TFLOPs formula (borrowed from Equation 3 in Section 5.1 of
+        # https://arxiv.org/pdf/2104.04473.pdf).
+        # https://github.com/bigscience-workshop/Megatron-DeepSpeed/pull/251/files
+        flops_per_iteration = (
+            24 * factor * self.global_batch_size * self.s * self.l * (self.h ** 2)
+        ) * (1.0 + (self.s / (6.0 * self.h)) + (self.v / (16.0 * self.l * self.h)))
+        tflops = flops_per_iteration / (
+            per_iteration_time * self.num_devices * (10 ** 12)
+        )
+        print(
+            f"Estimates: {tflops:.2f}TFLOPs Avg Iteration Time: {per_iteration_time:.2f}s"
+        )
+        torch.cuda.synchronize(self.device)
+        max_memory = torch.cuda.max_memory_allocated(self.device) / 2 ** 20
+        print(f"Average Peak CUDA memory {max_memory:.2f} MiB")
+
+
+def seed_everything(seed):
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+
+
 def main(
-        batch_size_per_gpu: int = 2,
-        accumulate_grad_batches: int = 1,
-        num_workers: int = 4,
-        epochs: int = 1,
-        block_size: int = 2048,
-        warmup: int = 20,
-        devices: int = 1,
-        precision: Union[str, int] = 16,
-        n_layer: int = 14,
-        n_head: int = 16,
-        n_embd: int = 2048,
-        attention: str = "scaled_dot_product",
-        sparse_block_size: int = 128,
-        strategy: str = "deepspeed",
-        stage: int = 3
+    batch_size_per_gpu: int = 36,
+    num_workers: int = 4,
+    epochs: int = 1,
+    block_size: int = 2048,
+    warmup: int = 20,
+    profile_start_step: int = 20,
+    profile_num_steps: int = 20,
+    logging_level: int = logging.INFO,
+    n_layer: int = 24,
+    n_head: int = 24,
+    n_embd: int = 2304,
+    sparse_block_size: int = 128,
+    stage: int = 3,
+    local_rank: int = 0,
+    precision: Union[str, int] = "bf16",
 ):
     seed_everything(42)
+    deepspeed.init_distributed()
+    deepspeed.utils.logging.logger.setLevel(logging_level)
+    local_rank = int(local_rank)
+    local_rank_zero = local_rank == 0
+    root_device = torch.device(f"cuda:{local_rank}")
+    num_devices = int(os.environ["WORLD_SIZE"])
 
-    if not os.path.exists("input.txt"):
+    torch.cuda.set_device(root_device)
+
+    # todo: replace with a meaningful dataset for us to train on
+    if not os.path.exists("input.txt") and local_rank_zero:
         os.system(
             "wget https://raw.githubusercontent.com/karpathy/char-rnn/master/data/tinyshakespeare/input.txt"
         )
+    torch.distributed.barrier()  # wait for main process to download input.txt
 
     text = open("input.txt", "r").read()
     train_dataset = CharDataset(text, block_size)
-    global_batch_size = batch_size_per_gpu * devices
+    train_loader = DataLoader(
+        train_dataset,
+        sampler=DistributedSampler(train_dataset),
+        batch_size=batch_size_per_gpu,
+        num_workers=num_workers,
+        pin_memory=True,
+    )
+
+    global_batch_size = batch_size_per_gpu * num_devices
+    model = LLM(
+        vocab_size=train_dataset.vocab_size,
+        block_size=train_dataset.block_size,
+        warmup_tokens=global_batch_size * warmup,
+        final_tokens=epochs * len(train_dataset) * block_size,
+        n_layer=n_layer,
+        n_head=n_head,
+        n_embd=n_embd,
+        sparse_block_size=sparse_block_size,
+    )
+
+    optimizer, scheduler = model.configure_optimizers()
+    model_parameters = filter(lambda p: p.requires_grad, model.parameters())
+
     config = {
         "zero_allow_untested_optimizer": True,
         "zero_optimization": {
@@ -273,56 +179,54 @@ def main(
             "overlap_comm": True,
             "allgather_partitions": True,
             "reduce_scatter": True,
+            "reduce_bucket_size": n_embd * n_embd,
+            "stage3_prefetch_bucket_size": 0.9 * n_embd * n_embd,
+            "stage3_param_persistence_threshold": 10 * n_embd,
         },
+        "gradient_clipping": 1,
         "train_micro_batch_size_per_gpu": batch_size_per_gpu,
         "bf16": {"enabled": precision == "bf16"},
-        "fp16": {"enabled": precision == 16}
+        "fp16": {"enabled": precision == 16},
     }
 
-    train_loader = DataLoader(
-        train_dataset,
-        sampler=RandomSampler(train_dataset),
-        batch_size=batch_size_per_gpu,
-        num_workers=num_workers,
-        pin_memory=True,
-    )
-    model = GPT(
-        vocab_size=train_dataset.vocab_size,
-        block_size=train_dataset.block_size,
-        attention=attention,
-        sparse_block_size=sparse_block_size,
-        warmup_tokens=global_batch_size * warmup,
-        final_tokens=epochs * len(train_dataset) * block_size,
-        n_layer=n_layer,
-        n_head=n_head,
-        n_embd=n_embd,
-    )
-    trainer = Trainer(
-        accelerator='gpu',
-        devices=devices,
-        strategy=DeepSpeedStrategy(config=config) if strategy == 'deepspeed' else strategy,
-        callbacks=[
-            GPTFLOPsEstimate(
-                global_batch_size=global_batch_size,
-                hidden_size=n_embd,
-                n_layer=n_layer,
-                block_size=block_size,
-                vocab_size=train_dataset.vocab_size,
-                activation_checkpointing=False
-            ),
-            CUDAMemoryCallback(),
-        ],
-        limit_train_batches=50,
-        max_epochs=epochs,
-        precision=precision,
-        gradient_clip_val=1,
-        log_every_n_steps=1,
-        accumulate_grad_batches=accumulate_grad_batches,
-        enable_checkpointing=False
+    deepspeed_engine, deepspeed_optimizer, _, _ = deepspeed.initialize(
+        args=argparse.Namespace(device_rank=root_device.index),
+        config=config,
+        model=model,
+        model_parameters=model_parameters,
+        optimizer=optimizer,
+        lr_scheduler=scheduler,
     )
 
-    trainer.fit(model, train_loader)
+    if local_rank_zero:
+        prof = Profiler(
+            global_batch_size=global_batch_size,
+            hidden_size=n_embd,
+            n_layer=n_layer,
+            block_size=block_size,
+            vocab_size=train_dataset.vocab_size,
+            activation_checkpointing=True,
+            num_devices=num_devices,
+            device=root_device,
+        )
+
+    data_length = len(train_loader)
+
+    for x, batch in enumerate(train_loader):
+        if x == profile_start_step and local_rank_zero:
+            prof.start_profiling()
+        src, targets = batch
+        batch = (src.to(root_device, non_blocking=True), targets.to(root_device, non_blocking=True))
+        loss = deepspeed_engine(batch)
+        if local_rank_zero:
+            pprint(f"[{x}/{data_length}]: Loss: {loss}")
+        deepspeed_engine.backward(loss)
+        deepspeed_engine.step()
+
+        if x == profile_start_step + profile_num_steps and local_rank_zero:
+            prof.end_profiling(profile_num_steps)
+            break
 
 
-if __name__ == '__main__':
+if __name__ == "__main__":
     fire.Fire(main)
