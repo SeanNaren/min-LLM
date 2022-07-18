@@ -10,41 +10,59 @@ import deepspeed
 import fire
 import numpy as np
 import torch
-from torch.utils.data import DataLoader, Dataset, DistributedSampler
+from datasets import load_dataset
+from torch.utils.data import DataLoader, IterableDataset
+from transformers import AutoTokenizer
+from transformers.utils import logging
 
 from model import LLM
 
 
-class CharDataset(Dataset):
-    def __init__(self, data, block_size):
-        chars = list(set(data))
-        data_size, vocab_size = len(data), len(chars)
-
-        self.stoi = {ch: i for i, ch in enumerate(chars)}
-        self.itos = {i: ch for i, ch in enumerate(chars)}
+class CharDataset(IterableDataset):
+    def __init__(self, block_size):
+        # some HF boilerplate
+        logging.set_verbosity(40)
+        os.environ["TOKENIZERS_PARALLELISM"] = "TRUE"
+        ds = load_dataset(
+            "oscar", "unshuffled_deduplicated_en", split="train", streaming=True
+        )
+        ds = ds.with_format("torch")
+        self.tokenizer = AutoTokenizer.from_pretrained("gpt2")
         self.block_size = block_size
-        self.vocab_size = vocab_size
-        self.data = data
 
-    def __len__(self):
-        return len(self.data) - self.block_size
+        block_size = block_size + 1
 
-    def __getitem__(self, i):
-        chunk = self.data[i : i + self.block_size + 1]
-        dix = [self.stoi[s] for s in chunk]
+        def convert_to_features(examples):
+            examples = self.tokenizer(examples["text"])
+            # Concatenate all texts.
+            concatenated_examples = {k: sum(examples[k], []) for k in examples.keys()}
+            total_length = len(concatenated_examples[list(examples.keys())[0]])
+            # We drop the small remainder, we could add padding if the model supported it instead of this drop, you can
+            # customize this part to your needs.
+            total_length = (total_length // block_size) * block_size
+            # Split by chunks of max_len.
+            result = {
+                k: [t[i : i + block_size] for i in range(0, total_length, block_size)]
+                for k, t in concatenated_examples.items()
+            }
+            return result
 
-        # src and target are off by one, we want the model to predict the next word
-        x = torch.tensor(dix[:-1], dtype=torch.long)
-        y = torch.tensor(dix[1:], dtype=torch.long)
-        return x, y
+        ds = ds.map(convert_to_features, remove_columns=["text", "id"], batched=True)
 
-    def to_tokens(self, message, device):
-        return torch.tensor([self.stoi[s] for s in message], dtype=torch.long)[
-            None, ...
-        ].to(device)
+        self.ds = ds
 
-    def from_tokens(self, tokens):
-        return "".join([self.itos[int(i)] for i in tokens])
+    def __iter__(self):
+        self.ds.shuffle()
+        for chunk in self.ds:
+            chunk = chunk["input_ids"]
+            # src and target are off by one, we want the model to predict the next word
+            x = torch.tensor(chunk[:-1], dtype=torch.long)
+            y = torch.tensor(chunk[1:], dtype=torch.long)
+            yield x, y
+
+    @property
+    def vocab_size(self) -> int:
+        return len(self.tokenizer)
 
 
 class Profiler:
@@ -113,9 +131,9 @@ def seed_everything(seed):
 
 
 def main(
-    batch_size_per_gpu: int = 36,
-    num_workers: int = 4,
-    epochs: int = 1,
+    num_iterations: int = 5000,
+    batch_size_per_gpu: int = 16,
+    num_workers: int = 8,
     block_size: int = 2048,
     warmup: int = 20,
     profile_start_step: int = 20,
@@ -129,7 +147,7 @@ def main(
     local_rank: int = 0,
     precision: Union[str, int] = "bf16",
 ):
-    seed_everything(42)
+    seed_everything(42 + local_rank)
     deepspeed.init_distributed()
     deepspeed.utils.logging.logger.setLevel(logging_level)
     local_rank = int(local_rank)
@@ -139,18 +157,9 @@ def main(
 
     torch.cuda.set_device(root_device)
 
-    # todo: replace with a meaningful dataset for us to train on
-    if not os.path.exists("input.txt") and local_rank_zero:
-        os.system(
-            "wget https://raw.githubusercontent.com/karpathy/char-rnn/master/data/tinyshakespeare/input.txt"
-        )
-    torch.distributed.barrier()  # wait for main process to download input.txt
-
-    text = open("input.txt", "r").read()
-    train_dataset = CharDataset(text, block_size)
+    train_dataset = CharDataset(block_size)
     train_loader = DataLoader(
         train_dataset,
-        sampler=DistributedSampler(train_dataset),
         batch_size=batch_size_per_gpu,
         num_workers=num_workers,
         pin_memory=True,
@@ -161,7 +170,7 @@ def main(
         vocab_size=train_dataset.vocab_size,
         block_size=train_dataset.block_size,
         warmup_tokens=global_batch_size * warmup,
-        final_tokens=epochs * len(train_dataset) * block_size,
+        final_tokens=num_iterations * block_size,
         n_layer=n_layer,
         n_head=n_head,
         n_embd=n_embd,
@@ -210,16 +219,19 @@ def main(
             device=root_device,
         )
 
-    data_length = len(train_loader)
-
-    for x, batch in enumerate(train_loader):
+    train_loader = iter(train_loader)
+    for x in range(num_iterations):
+        batch = next(train_loader)
         if x == profile_start_step and local_rank_zero:
             prof.start_profiling()
         src, targets = batch
-        batch = (src.to(root_device, non_blocking=True), targets.to(root_device, non_blocking=True))
+        batch = (
+            src.to(root_device, non_blocking=True),
+            targets.to(root_device, non_blocking=True),
+        )
         loss = deepspeed_engine(batch)
         if local_rank_zero:
-            pprint(f"[{x}/{data_length}]: Loss: {loss}")
+            pprint(f"[{x}]: Loss: {loss}")
         deepspeed_engine.backward(loss)
         deepspeed_engine.step()
 
