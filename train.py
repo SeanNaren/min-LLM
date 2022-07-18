@@ -13,21 +13,27 @@ import torch
 from datasets import load_dataset
 from torch.utils.data import DataLoader, IterableDataset
 from transformers import AutoTokenizer
+from transformers.utils import logging
 
 from model import LLM
 
 
 class CharDataset(IterableDataset):
     def __init__(self, block_size):
+        # some HF boilerplate
+        logging.set_verbosity(40)
         os.environ["TOKENIZERS_PARALLELISM"] = "TRUE"
-        ds = load_dataset('oscar', "unshuffled_deduplicated_en", split='train', streaming=True)
+        ds = load_dataset(
+            "oscar", "unshuffled_deduplicated_en", split="train", streaming=True
+        )
+        ds = ds.with_format("torch")
         self.tokenizer = AutoTokenizer.from_pretrained("gpt2")
         self.block_size = block_size
 
         block_size = block_size + 1
 
         def convert_to_features(examples):
-            examples = self.tokenizer(examples['text'])
+            examples = self.tokenizer(examples["text"])
             # Concatenate all texts.
             concatenated_examples = {k: sum(examples[k], []) for k in examples.keys()}
             total_length = len(concatenated_examples[list(examples.keys())[0]])
@@ -36,12 +42,12 @@ class CharDataset(IterableDataset):
             total_length = (total_length // block_size) * block_size
             # Split by chunks of max_len.
             result = {
-                k: [t[i: i + block_size] for i in range(0, total_length, block_size)]
+                k: [t[i : i + block_size] for i in range(0, total_length, block_size)]
                 for k, t in concatenated_examples.items()
             }
             return result
 
-        ds = ds.map(convert_to_features, remove_columns=['text', 'id'], batched=True)
+        ds = ds.map(convert_to_features, remove_columns=["text", "id"], batched=True)
 
         self.ds = ds
 
@@ -126,7 +132,7 @@ def seed_everything(seed):
 
 def main(
     num_iterations: int = 5000,
-    batch_size_per_gpu: int = 36,
+    batch_size_per_gpu: int = 16,
     num_workers: int = 8,
     block_size: int = 2048,
     warmup: int = 20,
@@ -219,7 +225,10 @@ def main(
         if x == profile_start_step and local_rank_zero:
             prof.start_profiling()
         src, targets = batch
-        batch = (src.to(root_device, non_blocking=True), targets.to(root_device, non_blocking=True))
+        batch = (
+            src.to(root_device, non_blocking=True),
+            targets.to(root_device, non_blocking=True),
+        )
         loss = deepspeed_engine(batch)
         if local_rank_zero:
             pprint(f"[{x}]: Loss: {loss}")
