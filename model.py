@@ -7,13 +7,8 @@ import torch.nn as nn
 from apex.normalization import FusedLayerNorm
 from deepspeed.ops.adam import FusedAdam
 from torch.nn import functional as F
-from xformers.components import (
-    Activation,
-    LayerNormStyle,
-    MultiHeadDispatch,
-    RequiresWrappedInputs,
-    Residual,
-)
+from xformers.components import (Activation, LayerNormStyle, MultiHeadDispatch,
+                                 RequiresWrappedInputs, Residual)
 from xformers.components.attention import BlockSparseAttention
 from xformers.components.feedforward import MLP
 from xformers.components.positional_embedding import VocabEmbedding

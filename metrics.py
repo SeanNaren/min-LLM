@@ -45,7 +45,7 @@ class Metrics:
         for key, value in logger_dict.items():
             self.logger.add_scalar(key, value, global_step=self.iteration)
         # print to stdout
-        logger_dict["learning_rate"] = '%.3E' % Decimal(self.learning_rate)
+        logger_dict["learning_rate"] = "%.3E" % Decimal(self.learning_rate)
         logger_string = " | ".join(f"{k} : {v}" for k, v in logger_dict.items())
         logger_string = f"[{self.iteration}/{self.iterations}] | secs/it {self.per_iteration_time:.2f} | {logger_string}"
         print(logger_string)
