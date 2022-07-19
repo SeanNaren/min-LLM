@@ -2,9 +2,8 @@ import argparse
 import logging
 import os
 import random
-import time
 from pprint import pprint
-from typing import Union
+from typing import Optional, Union
 
 import deepspeed
 import fire
@@ -12,6 +11,7 @@ import numpy as np
 import torch
 from datasets import load_dataset
 from torch.utils.data import DataLoader, IterableDataset
+from torch.utils.tensorboard import SummaryWriter
 from transformers import AutoTokenizer
 from transformers.utils import logging
 
@@ -65,64 +65,6 @@ class CharDataset(IterableDataset):
         return len(self.tokenizer)
 
 
-class Profiler:
-    def __init__(
-        self,
-        global_batch_size: int,
-        hidden_size: int,
-        num_devices: int,
-        device: torch.device,
-        n_layer: int,
-        block_size: int,
-        vocab_size: int,
-        activation_checkpointing: bool = False,
-    ):
-        self.global_batch_size = global_batch_size
-        self.activation_checkpointing = activation_checkpointing
-        self.num_devices = num_devices
-        self.device = device
-        self.s = block_size
-        self.h = hidden_size
-        self.l = n_layer
-        self.v = vocab_size
-
-        self.num_parameters = (
-            self.l * (12 * self.h ** 2 + 13 * self.h)
-            + self.v * self.h
-            + self.s * self.h
-            + 2 * self.h
-        ) / 10 ** 9
-        print(f"Number of parameters: {self.num_parameters:.2f} Billion")
-
-        torch.cuda.reset_peak_memory_stats(self.device)
-        torch.cuda.synchronize(self.device)
-
-    def start_profiling(self):
-        torch.cuda.synchronize(self.device)
-        self.start = time.time()
-
-    def end_profiling(self, num_steps) -> None:
-        torch.cuda.synchronize(self.device)
-        total_time = time.time() - self.start
-        factor = 4 if self.activation_checkpointing else 3
-        per_iteration_time = total_time / num_steps
-        # General TFLOPs formula (borrowed from Equation 3 in Section 5.1 of
-        # https://arxiv.org/pdf/2104.04473.pdf).
-        # https://github.com/bigscience-workshop/Megatron-DeepSpeed/pull/251/files
-        flops_per_iteration = (
-            24 * factor * self.global_batch_size * self.s * self.l * (self.h ** 2)
-        ) * (1.0 + (self.s / (6.0 * self.h)) + (self.v / (16.0 * self.l * self.h)))
-        tflops = flops_per_iteration / (
-            per_iteration_time * self.num_devices * (10 ** 12)
-        )
-        print(
-            f"Estimates: {tflops:.2f}TFLOPs Avg Iteration Time: {per_iteration_time:.2f}s"
-        )
-        torch.cuda.synchronize(self.device)
-        max_memory = torch.cuda.max_memory_allocated(self.device) / 2 ** 20
-        print(f"Average Peak CUDA memory {max_memory:.2f} MiB")
-
-
 def seed_everything(seed):
     random.seed(seed)
     np.random.seed(seed)
@@ -131,7 +73,7 @@ def seed_everything(seed):
 
 
 def main(
-    num_iterations: int = 5000,
+    num_iterations: int = 50000,
     batch_size_per_gpu: int = 16,
     num_workers: int = 8,
     block_size: int = 2048,
@@ -146,6 +88,9 @@ def main(
     stage: int = 3,
     local_rank: int = 0,
     precision: Union[str, int] = "bf16",
+    log_dir: Optional[str] = None,
+    save_every_n_steps: Optional[int] = None,
+    save_dir: str = "checkpoints/",
 ):
     seed_everything(42 + local_rank)
     deepspeed.init_distributed()
@@ -207,23 +152,11 @@ def main(
         lr_scheduler=scheduler,
     )
 
-    if local_rank_zero:
-        prof = Profiler(
-            global_batch_size=global_batch_size,
-            hidden_size=n_embd,
-            n_layer=n_layer,
-            block_size=block_size,
-            vocab_size=train_dataset.vocab_size,
-            activation_checkpointing=True,
-            num_devices=num_devices,
-            device=root_device,
-        )
-
     train_loader = iter(train_loader)
+    logger = SummaryWriter(log_dir=log_dir, flush_secs=1)
+
     for x in range(num_iterations):
         batch = next(train_loader)
-        if x == profile_start_step and local_rank_zero:
-            prof.start_profiling()
         src, targets = batch
         batch = (
             src.to(root_device, non_blocking=True),
@@ -231,13 +164,13 @@ def main(
         )
         loss = deepspeed_engine(batch)
         if local_rank_zero:
+            logger.add_scalar("Loss/train", float(loss.item()), global_step=x)
             pprint(f"[{x}]: Loss: {loss}")
         deepspeed_engine.backward(loss)
         deepspeed_engine.step()
 
-        if x == profile_start_step + profile_num_steps and local_rank_zero:
-            prof.end_profiling(profile_num_steps)
-            break
+        if save_every_n_steps and x > 0 and x % save_every_n_steps == 0:
+            deepspeed_engine.save_checkpoint(save_dir)
 
 
 if __name__ == "__main__":

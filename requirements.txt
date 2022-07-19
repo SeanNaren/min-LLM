@@ -2,3 +2,5 @@ deepspeed
 fire
 git+https://github.com/facebookresearch/xformers.git
 triton>=2.0.0.dev20220425
+datasets
+transformers
