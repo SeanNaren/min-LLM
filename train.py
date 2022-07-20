@@ -76,7 +76,9 @@ def main(
     model_parameters = filter(lambda p: p.requires_grad, model.parameters())
 
     # round up to the nearest batch (we're probably seeing more tokens than we want per update as a result)
-    accumulation_steps = math.ceil(global_batch_size_tokens / (block_size * batch_size_per_gpu * num_devices))
+    accumulation_steps = math.ceil(
+        global_batch_size_tokens / (block_size * batch_size_per_gpu * num_devices)
+    )
     config = {
         "zero_allow_untested_optimizer": True,
         "zero_optimization": {
@@ -131,7 +133,12 @@ def main(
         deepspeed_engine.backward(loss)
         deepspeed_engine.step()
 
-        if save_every_n_steps and x > 0 and x % save_every_n_steps == 0 and deepspeed_engine.is_gradient_accumulation_boundary():
+        if (
+            save_every_n_steps
+            and x > 0
+            and x % save_every_n_steps == 0
+            and deepspeed_engine.is_gradient_accumulation_boundary()
+        ):
             deepspeed_engine.save_checkpoint(save_dir)
 
 
