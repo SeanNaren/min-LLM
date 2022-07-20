@@ -33,8 +33,8 @@ pip install -r requirements.txt
 To train a 1.5B parameter model based on the Megatron architecture sizes using 8 GPUs (model will not fit on 1 GPU with optimal throughput, we scale to multiple).
 
 ```
-deepspeed --num_gpus 8 train.py --batch_size_per_gpu 36
-```
+deepspeed --num_gpus 8 train.py --batch_size_per_gpu 16
+``` 
 
 ## References
 

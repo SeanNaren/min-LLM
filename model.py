@@ -196,7 +196,7 @@ class LLM(torch.nn.Module):
 
         self.dummy_tensor = torch.ones(1, dtype=torch.float32, requires_grad=True)
 
-        self._tokens_seen = 0
+        self.tokens_seen = 0
 
         blocks = []
         for i in range(self.n_layer):
@@ -240,7 +240,7 @@ class LLM(torch.nn.Module):
             module.weight.data.fill_(1.0)
 
         # Reset the token counter
-        self._tokens_seen = 0
+        self.tokens_seen = 0
 
     def configure_optimizers(self):
         # Create the optimizer and the training schedule:
@@ -262,13 +262,13 @@ class LLM(torch.nn.Module):
 
         def update_lr(*_):
 
-            if self._tokens_seen < self.warmup_tokens:
+            if self.tokens_seen < self.warmup_tokens:
                 # linear warmup
-                lr_mult = float(self._tokens_seen) / float(max(1, self.warmup_tokens))
+                lr_mult = float(self.tokens_seen) / float(max(1, self.warmup_tokens))
                 lr_mult = max(lr_mult, 1e-2)  # could be that we've not seen any yet
             else:
                 # cosine learning rate decay
-                progress = float(self._tokens_seen - self.warmup_tokens) / float(
+                progress = float(self.tokens_seen - self.warmup_tokens) / float(
                     max(1, self.final_tokens - self.warmup_tokens)
                 )
                 lr_mult = max(0.1, 0.5 * (1.0 + math.cos(math.pi * progress)))
@@ -282,6 +282,10 @@ class LLM(torch.nn.Module):
 
     def forward(self, batch):
         x, targets = batch
+
+        # Update the tokens we've seen (tracked for LR scheduling)
+        self.tokens_seen += (x >= 0).numel()
+
         # encode to latent space
         for encoder in self.encoders:
             x = deepspeed.checkpointing.checkpoint(encoder, x, self.dummy_tensor)
