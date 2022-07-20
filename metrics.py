@@ -11,7 +11,7 @@ class Metrics:
     def __init__(
         self,
         log_dir: str,
-        deepspeed_engine: DeepSpeedEngine,
+        engine: DeepSpeedEngine,
         iterations: int,
         batch_size: int,
         block_size: int,
@@ -24,7 +24,7 @@ class Metrics:
         self.per_iteration_time = 0
         self.start = time.time()
         self.logger = SummaryWriter(log_dir=log_dir, flush_secs=1)
-        self.deepspeed_engine = deepspeed_engine
+        self.engine = engine
         self.batch_size = batch_size
         self.block_size = block_size
         self.iterations = iterations
@@ -67,7 +67,7 @@ class Metrics:
 
     @property
     def learning_rate(self) -> float:
-        return self.deepspeed_engine.get_lr()[0]
+        return self.engine.get_lr()[0]
 
     @property
     def consumed_samples(self) -> int:

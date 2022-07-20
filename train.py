@@ -1,4 +1,5 @@
 import argparse
+import math
 import os
 import random
 from typing import Optional, Union
@@ -25,9 +26,10 @@ def seed_everything(seed):
 def main(
     num_iterations: int = 50000,
     batch_size_per_gpu: int = 16,
+    global_batch_size_tokens: int = 500_000,
+    warmup_tokens: int = 375_000_000,
     num_workers: int = 8,
     block_size: int = 2048,
-    warmup: int = 20,
     logging_level: int = logging.INFO,
     n_layer: int = 24,
     n_head: int = 24,
@@ -58,12 +60,12 @@ def main(
         pin_memory=True,
     )
 
-    global_batch_size = batch_size_per_gpu * num_devices
     model = LLM(
         vocab_size=train_dataset.vocab_size,
         block_size=train_dataset.block_size,
-        warmup_tokens=global_batch_size * warmup,
-        final_tokens=num_iterations * block_size,
+        # LR scheduler only needs to worry about local device tokens processed
+        warmup_tokens=int(warmup_tokens / num_devices),
+        final_tokens=int((global_batch_size_tokens * num_iterations) / num_devices),
         n_layer=n_layer,
         n_head=n_head,
         n_embd=n_embd,
@@ -73,6 +75,8 @@ def main(
     optimizer, scheduler = model.configure_optimizers()
     model_parameters = filter(lambda p: p.requires_grad, model.parameters())
 
+    # round up to the nearest batch (we're probably seeing more tokens than we want per update as a result)
+    accumulation_steps = math.ceil(global_batch_size_tokens / (block_size * batch_size_per_gpu * num_devices))
     config = {
         "zero_allow_untested_optimizer": True,
         "zero_optimization": {
@@ -87,6 +91,7 @@ def main(
         },
         "gradient_clipping": 1,
         "train_micro_batch_size_per_gpu": batch_size_per_gpu,
+        "gradient_accumulation_steps": accumulation_steps,
         "bf16": {"enabled": precision == "bf16"},
         "fp16": {"enabled": precision == 16},
     }
@@ -103,9 +108,9 @@ def main(
     train_loader = iter(train_loader)
     metrics = Metrics(
         log_dir=log_dir,
-        deepspeed_engine=deepspeed_engine,
+        engine=deepspeed_engine,
         iterations=num_iterations,
-        batch_size=global_batch_size,
+        batch_size=batch_size_per_gpu * num_devices,
         block_size=block_size,
         hidden_size=n_embd,
         n_layer=n_layer,
@@ -126,7 +131,7 @@ def main(
         deepspeed_engine.backward(loss)
         deepspeed_engine.step()
 
-        if save_every_n_steps and x > 0 and x % save_every_n_steps == 0:
+        if save_every_n_steps and x > 0 and x % save_every_n_steps == 0 and deepspeed_engine.is_gradient_accumulation_boundary():
             deepspeed_engine.save_checkpoint(save_dir)
 
 
