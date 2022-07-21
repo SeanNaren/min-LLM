@@ -7,8 +7,9 @@ import torch.nn as nn
 from apex.normalization import FusedLayerNorm
 from deepspeed.ops.adam import FusedAdam
 from torch.nn import functional as F
-from xformers.components import (Activation, LayerNormStyle, MultiHeadDispatch,
-                                 RequiresWrappedInputs, Residual)
+from xformers.components import (Activation, MultiHeadDispatch,
+                                 RequiresWrappedInputs, Residual,
+                                 ResidualNormStyle)
 from xformers.components.attention import BlockSparseAttention
 from xformers.components.feedforward import MLP
 from xformers.components.positional_embedding import VocabEmbedding
@@ -34,23 +35,23 @@ class ModuleWrapperIgnores2ndArg(nn.Module):
 
 class EncoderLayerNorm(nn.Module, RequiresWrappedInputs):
     def __init__(
-        self, module: nn.Module, dim_model: int, layer_norm_style: LayerNormStyle
+        self, module: nn.Module, dim_model: int, residual_norm_style: ResidualNormStyle
     ):
         super().__init__()
         self.sublayer = module
-        self.layer_norm_style = layer_norm_style
+        self.residual_norm_style = residual_norm_style
         self.norm = FusedLayerNorm(dim_model)
         self.wrap_inputs = isinstance(self.sublayer, RequiresWrappedInputs)
 
     def forward(self, inputs: List[torch.Tensor], **kwargs):
         x = inputs
-        if self.layer_norm_style == LayerNormStyle.Pre:
+        if self.residual_norm_style == ResidualNormStyle.Pre:
             x = self._apply_xformer_pre_norm(x)
         if self.wrap_inputs:
             x = self.sublayer(inputs=x, **kwargs)
         else:
             x = self.sublayer(*x, **kwargs)
-        if self.layer_norm_style == LayerNormStyle.Post:
+        if self.residual_norm_style == ResidualNormStyle.Post:
             x = self.norm(x)
         return x
 
@@ -82,7 +83,7 @@ class EncoderBlock(nn.Module):
         mlp_pdrop: float,
         residual_pdrop: float,
         attn_pdrop: float,
-        layer_norm_style: LayerNormStyle,
+        residual_norm_style: ResidualNormStyle,
         hidden_layer_multiplier: int,
         last_encoder_block: bool,
     ):
@@ -107,7 +108,9 @@ class EncoderBlock(nn.Module):
             residual_dropout=residual_pdrop,
         )
         self.attention = self._wrap_with_residual_layer_norm(
-            multi_head_attention, dim_model=dim_model, layer_norm_style=layer_norm_style
+            multi_head_attention,
+            dim_model=dim_model,
+            residual_norm_style=residual_norm_style,
         )
 
         ff = MLP(
@@ -118,16 +121,16 @@ class EncoderBlock(nn.Module):
         )
 
         ff = self._wrap_with_residual_layer_norm(
-            ff, dim_model=dim_model, layer_norm_style=layer_norm_style
+            ff, dim_model=dim_model, residual_norm_style=residual_norm_style
         )
-        if layer_norm_style == LayerNormStyle.Pre and last_encoder_block:
-            ff = EncoderLayerNorm(ff, dim_model, LayerNormStyle.Post)
+        if residual_norm_style == ResidualNormStyle.Pre and last_encoder_block:
+            ff = EncoderLayerNorm(ff, dim_model, ResidualNormStyle.Post)
         self.ff = ff
 
     def _wrap_with_residual_layer_norm(
-        self, module, dim_model, layer_norm_style
+        self, module, dim_model, residual_norm_style
     ) -> Residual:
-        return Residual(EncoderLayerNorm(module, dim_model, layer_norm_style))
+        return Residual(EncoderLayerNorm(module, dim_model, residual_norm_style))
 
     def forward(
         self,
@@ -216,7 +219,7 @@ class LLM(torch.nn.Module):
                 attn_pdrop=self.attn_pdrop,
                 mlp_pdrop=self.mlp_pdrop,
                 residual_pdrop=self.resid_pdrop,
-                layer_norm_style=LayerNormStyle.Pre,
+                residual_norm_style=ResidualNormStyle.Pre,
                 hidden_layer_multiplier=self.hidden_layer_multiplier,
             )
             blocks.append(ModuleWrapperIgnores2ndArg(encoder))
@@ -224,18 +227,19 @@ class LLM(torch.nn.Module):
         self.encoders = torch.nn.ModuleList(blocks)
 
         # decoder head
-        self.ln_f = torch.nn.LayerNorm(self.n_embd)
+        self.ln_f = FusedLayerNorm(self.n_embd)
         self.head = FusedLinear(self.n_embd, self.vocab_size, bias=False)
 
-        # todo: when using model parallelism, this will be wrong. will need to redo
         self.apply(self._init_weights)
 
     def _init_weights(self, module):
-        if isinstance(module, (nn.Linear, nn.Embedding)):
-            module.weight.data.normal_(mean=0.0, std=0.02)
-            if isinstance(module, nn.Linear) and module.bias is not None:
+        if isinstance(module, (FusedLinear, nn.Linear, nn.Embedding)):
+            # taken from
+            # https://github.com/bigscience-workshop/Megatron-DeepSpeed/commit/a6bf1a042dd28eae77200461d735a399377fd4c3
+            module.weight.data.normal_(mean=0.0, std=0.006)
+            if isinstance(module, (nn.Linear, FusedLinear)) and module.bias is not None:
                 module.bias.data.zero_()
-        elif isinstance(module, nn.LayerNorm):
+        elif isinstance(module, (nn.LayerNorm, FusedLayerNorm)):
             module.bias.data.zero_()
             module.weight.data.fill_(1.0)
 
