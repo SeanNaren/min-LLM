@@ -71,7 +71,7 @@ class Metrics:
 
     @property
     def consumed_samples(self) -> int:
-        return self.batch_size * self.iteration
+        return self.batch_size * (self.iteration + 1)
 
     @property
     def consumed_tokens(self) -> int:

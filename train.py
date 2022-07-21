@@ -60,21 +60,6 @@ def main(
         pin_memory=True,
     )
 
-    model = LLM(
-        vocab_size=train_dataset.vocab_size,
-        block_size=train_dataset.block_size,
-        # LR scheduler only needs to worry about local device tokens processed
-        warmup_tokens=int(warmup_tokens / num_devices),
-        final_tokens=int((global_batch_size_tokens * num_iterations) / num_devices),
-        n_layer=n_layer,
-        n_head=n_head,
-        n_embd=n_embd,
-        sparse_block_size=sparse_block_size,
-    )
-
-    optimizer, scheduler = model.configure_optimizers()
-    model_parameters = filter(lambda p: p.requires_grad, model.parameters())
-
     # round up to the nearest batch (we're probably seeing more tokens than we want per update as a result)
     accumulation_steps = math.ceil(
         global_batch_size_tokens / (block_size * batch_size_per_gpu * num_devices)
@@ -97,6 +82,22 @@ def main(
         "bf16": {"enabled": precision == "bf16"},
         "fp16": {"enabled": precision == 16},
     }
+
+    with deepspeed.zero.Init(config_dict_or_path=config):
+        model = LLM(
+            vocab_size=train_dataset.vocab_size,
+            block_size=train_dataset.block_size,
+            # LR scheduler only needs to worry about local device tokens processed
+            warmup_tokens=int(warmup_tokens / num_devices),
+            final_tokens=int((global_batch_size_tokens * num_iterations) / num_devices),
+            n_layer=n_layer,
+            n_head=n_head,
+            n_embd=n_embd,
+            sparse_block_size=sparse_block_size,
+        )
+
+    optimizer, scheduler = model.configure_optimizers()
+    model_parameters = filter(lambda p: p.requires_grad, model.parameters())
 
     deepspeed_engine, deepspeed_optimizer, _, _ = deepspeed.initialize(
         args=argparse.Namespace(device_rank=root_device.index),
