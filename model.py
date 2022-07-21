@@ -7,8 +7,9 @@ import torch.nn as nn
 from apex.normalization import FusedLayerNorm
 from deepspeed.ops.adam import FusedAdam
 from torch.nn import functional as F
-from xformers.components import (Activation, ResidualNormStyle, MultiHeadDispatch,
-                                 RequiresWrappedInputs, Residual)
+from xformers.components import (Activation, MultiHeadDispatch,
+                                 RequiresWrappedInputs, Residual,
+                                 ResidualNormStyle)
 from xformers.components.attention import BlockSparseAttention
 from xformers.components.feedforward import MLP
 from xformers.components.positional_embedding import VocabEmbedding
@@ -107,7 +108,9 @@ class EncoderBlock(nn.Module):
             residual_dropout=residual_pdrop,
         )
         self.attention = self._wrap_with_residual_layer_norm(
-            multi_head_attention, dim_model=dim_model, residual_norm_style=residual_norm_style
+            multi_head_attention,
+            dim_model=dim_model,
+            residual_norm_style=residual_norm_style,
         )
 
         ff = MLP(
