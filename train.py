@@ -14,6 +14,7 @@ from transformers.utils import logging
 from data import CharDataset
 from metrics import Metrics
 from model import LLM
+from profiler import Profiler
 
 
 def seed_everything(seed):
@@ -60,10 +61,6 @@ def main(
         pin_memory=True,
     )
 
-    # round up to the nearest batch (we're probably seeing more tokens than we want per update as a result)
-    accumulation_steps = math.ceil(
-        global_batch_size_tokens / (block_size * batch_size_per_gpu * num_devices)
-    )
     config = {
         "zero_allow_untested_optimizer": True,
         "zero_optimization": {
@@ -78,7 +75,8 @@ def main(
         },
         "gradient_clipping": 1,
         "train_micro_batch_size_per_gpu": batch_size_per_gpu,
-        "gradient_accumulation_steps": accumulation_steps,
+        # todo: not totally correct, but we want to do a step per iteration for profiling.
+        "gradient_accumulation_steps": 1,
         "bf16": {"enabled": precision == "bf16"},
         "fp16": {"enabled": precision == 16},
     }
@@ -120,8 +118,20 @@ def main(
         vocab_size=train_dataset.vocab_size,
         num_devices=num_devices,
     )
+    profiler = Profiler(
+        global_batch_size=batch_size_per_gpu * num_devices,
+        hidden_size=n_embd,
+        num_devices=num_devices,
+        device=root_device,
+        n_layer=n_layer,
+        block_size=block_size,
+        vocab_size=train_dataset.vocab_size,
+        activation_checkpointing=True
+    )
 
     for x in range(num_iterations):
+        if x == 10:
+            profiler.start_profiling()
         batch = next(train_loader)
         src, targets = batch
         batch = (
@@ -134,13 +144,9 @@ def main(
         deepspeed_engine.backward(loss)
         deepspeed_engine.step()
 
-        if (
-            save_every_n_steps
-            and x > 0
-            and x % save_every_n_steps == 0
-            and deepspeed_engine.is_gradient_accumulation_boundary()
-        ):
-            deepspeed_engine.save_checkpoint(save_dir)
+        if x == 20:
+            profiler.end_profiling(10)
+
 
 
 if __name__ == "__main__":
